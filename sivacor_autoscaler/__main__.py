@@ -73,6 +73,21 @@ def main() -> int:
     if not cfg.template.is_file():
         sys.exit(f"worker template not found: {cfg.template}")
 
+    # Not fatal -- a keyless fleet is a legitimate production posture, and workers
+    # hold no key material worth reaching for. But it is a terrible *debugging*
+    # posture, and fleet.create_instance omits key_name silently when it is unset,
+    # so the first time anyone finds out is when a worker misbehaves and there is no
+    # way in. That happened on 2026-08-01. Warn here rather than at create time: it
+    # fires once, before anything is spent, and covers --dry-run too.
+    if cfg.key_name:
+        logging.getLogger(__name__).info("workers get keypair %r", cfg.key_name)
+    else:
+        logging.getLogger(__name__).warning(
+            "SIVACOR_OS_KEYPAIR is unset: workers launch with NO ssh key. A worker "
+            "that fails to power itself off is then diagnosable only from "
+            "`openstack console log show` and the broker."
+        )
+
     import openstack
     import redis as redis_lib
     from girder_client import GirderClient
