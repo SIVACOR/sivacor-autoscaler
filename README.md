@@ -63,20 +63,45 @@ export SIVACOR_MANAGER_TENANT_IP=10.3.37.197
 export MASTER_KEY_HEX=...      REDIS_PASSWORD=...     # same values as the manager
 export GIRDER_API_URL=https://girder.test.sivacor.org/api/v1
 export GIRDER_API_KEY=...
+export SIVACOR_OS_KEYPAIR=shakuras           # or workers launch with NO ssh key
 
 sivacor-autoscaler --dry-run     # decide and explain, change nothing
 sivacor-autoscaler --once        # one iteration
 sivacor-autoscaler               # loop
 ```
 
+`SIVACOR_OS_KEYPAIR` is optional and the startup log says which way it went. Leaving it
+unset is a defensible production posture — workers hold no key material worth reaching
+for — but a terrible debugging one, and a key cannot be added to a running instance.
+Set it on any fleet you might need to inspect.
+
 `--dry-run` runs the same `gather()` + `decide()` as a live round and skips only
 execution, so it exercises the real code path rather than a parallel one. Start there.
 
+## How instances actually get reclaimed
+
+Two mechanisms, and the controller only owns the second.
+
+**The worker powers itself off** (P3.3), via `sivacor-worker-idle-check` installed by
+`deploy-sivacor/worker-cloud-init.sh` — not by this repo. Every 2 min it asks: past the
+boot grace, no analysis containers, no active celery tasks, idle long enough? Then
+`systemctl poweroff`. The controller reaps the resulting `SHUTOFF` instance, which is
+why a worker needs no OpenStack credentials.
+
+**That supervisor is fail-safe-to-busy**: any probe that cannot answer means "stay up".
+The consequence is worth stating plainly — **a worker whose celery container dies stops
+answering `inspect`, reports busy forever, and lives until `SIVACOR_MAX_LIFETIME_HOURS`
+(default 30).** Observed once on 2026-08-01. So the max-lifetime net is not a
+belt-and-braces nicety; it is the only thing that bounds that case, and its default is
+deliberately long because every boot includes a cold image pull.
+
+To see why a worker stayed up, `journalctl -u sivacor-worker-idle` on the box, or
+`openstack console log show <id>` if you cannot get in — the unit logs to the serial
+console (`deploy-sivacor@2d98cb7`) precisely because a keyless fleet once made this
+undiagnosable.
+
 ## Not implemented yet
 
-- **P3.3, the self-shutdown supervisor** that runs *on the worker* and powers it off
-  when idle. Until it exists, instances are only reclaimed by the maximum-lifetime net,
-  so watch `--dry-run` output and delete by hand.
 - **Prepull.** Workers are interchangeable on purpose: a submission's images are pulled
   inside the run, where the heartbeat covers the silence. Targeted prepull would mean
   the controller inspecting queue *contents* rather than depth, and instances ceasing
