@@ -61,13 +61,31 @@ def main() -> int:
         help="report the decision without creating or deleting anything",
     )
     p.add_argument("--cloud", help="clouds.yaml entry; omit to use OS_* env vars")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="debug logging for this package only; HTTP client logs stay at INFO",
+    )
     args = p.parse_args()
 
+    # -v raises ONLY this package. It used to set the root logger to DEBUG, which
+    # made keystoneauth log every HTTP request body -- including the Nova POST that
+    # carries the worker user-data. That is base64, not encryption: one decode yields
+    # MASTER_KEY_HEX and REDIS_PASSWORD in cleartext, and it reached a shared log on
+    # 2026-08-01. Secrets travel in user-data (P2.2), so any library that logs a
+    # request body is a secret sink. -v means "explain your decisions", never "dump
+    # every HTTP body".
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    if args.verbose:
+        logging.getLogger(__package__).setLevel(logging.DEBUG)
+    # Belt and braces: pin the request-body loggers even if the root level is raised
+    # by a future edit or an outer harness.
+    for noisy in ("keystoneauth", "openstack", "urllib3", "requests", "swiftclient"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
     cfg = build_config()
     if not cfg.template.is_file():
