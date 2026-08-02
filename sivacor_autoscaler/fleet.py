@@ -153,7 +153,7 @@ def _is_quota_error(exc) -> bool:
     """Nova signals a full allocation with 403 plus a quota message."""
     if getattr(exc, "status_code", None) != 403:
         return False
-    return bool(re.search(r"quota|exceed", str(exc), re.I))
+    return bool(re.search(r"quota|exceed", str(exc), re.IGNORECASE))
 
 
 def _parse_time(value):

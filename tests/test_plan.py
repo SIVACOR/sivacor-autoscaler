@@ -175,7 +175,10 @@ def test_naive_timestamps_do_not_raise():
     than a comment.
     """
     naive = Instance(
-        id="n", name="n", status="ACTIVE", created_at=datetime(2026, 8, 1, 11, 0)
+        id="n",
+        name="n",
+        status="ACTIVE",
+        created_at=datetime(2026, 8, 1, 11, 0, tzinfo=timezone.utc),
     )
     d = decide(
         FleetState(queue_depth=0, serving=0, instances=(naive,), now=None), LIMITS

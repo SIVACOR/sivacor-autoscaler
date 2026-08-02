@@ -8,6 +8,7 @@ busiest, and the only symptom is submissions queueing behind an idle controller.
 from pathlib import Path
 
 import pytest
+
 from sivacor_autoscaler import fleet
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "deploy-sivacor" / "worker-cloud-init.sh"
