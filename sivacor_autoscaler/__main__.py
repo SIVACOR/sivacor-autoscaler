@@ -133,17 +133,32 @@ def main() -> int:
 
     import openstack
     import redis as redis_lib
-    from girder_client import GirderClient
+    from pymongo import MongoClient
 
     conn = openstack.connect(cloud=args.cloud) if args.cloud else openstack.connect()
-    redis_client = redis_lib.Redis.from_url(
-        f"redis://:{cfg.redis_password}@{cfg.manager_ip}:6379/"
+    # How *we* reach the broker is not how *workers* reach it, and conflating the two
+    # is what would force production to publish 6379. A worker is off-box and must use
+    # the manager's tenant address; this process may be running inside the stack, where
+    # the `redis` service name resolves on the overlay network and no published port is
+    # needed at all. `SIVACOR_MANAGER_TENANT_IP` therefore keeps its one real job --
+    # the value injected into worker user-data -- and this is a separate knob.
+    #
+    # Default preserves the pre-container behaviour exactly, so running from a checkout
+    # on the manager needs no new configuration.
+    redis_url = _env(
+        "SIVACOR_REDIS_URL", f"redis://:{cfg.redis_password}@{cfg.manager_ip}:6379/"
     )
-    girder = GirderClient(apiUrl=_env("GIRDER_API_URL", required=True))
-    if api_key := _env("GIRDER_API_KEY"):
-        girder.authenticate(apiKey=api_key)
+    redis_client = redis_lib.Redis.from_url(redis_url)
+    # Girder's database, not its REST API -- no API key to bootstrap and no endpoint
+    # scoping to get wrong. See signals.JOB_COLLECTION. `tz_aware` matters: Girder
+    # writes tz-aware datetimes and pymongo hands back naive ones without it, which
+    # turns every timestamp comparison into a silent TypeError. The server-side reaper
+    # hit exactly that and has to normalise by hand.
+    mongo = MongoClient(_env("GIRDER_MONGO_URI", "mongodb://mongo:27017/girder"),
+                        tz_aware=True)
+    db = mongo.get_default_database()
 
-    controller = Controller(conn, redis_client, girder, cfg)
+    controller = Controller(conn, redis_client, db, cfg)
 
     if args.dry_run:
         # Deliberately reuses gather() + decide() so a dry run exercises the same code

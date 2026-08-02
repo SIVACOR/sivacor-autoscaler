@@ -1,32 +1,74 @@
 """Tests for the Girder-side signals.
 
-Two kinds of case here. Most parse a marker written by another repo, so they are
-about being unsurprised by what Girder actually returns. The rest pin the *endpoint*,
-which is not decoration: reading the wrong one returns ``200`` and an empty list, so
-both signals fail silently as "nothing running, nothing spent". A stub cannot tell
-the two endpoints apart -- these assert the request, which is the one thing about it
-a stub can still verify. See :data:`~sivacor_autoscaler.signals.JOB_LIST_ENDPOINT`.
+These parse a marker written by another repo, so most cases are about being
+unsurprised by what Girder's job documents actually contain.
+
+The signals read MongoDB directly rather than the REST API. That is not only about
+the API key: ``GET /job`` silently scopes to the authenticated caller, which made
+both signals return ``[]`` for the controller's entire life and cost an 18 min stall
+(plan run 5). A query has no hidden scoping, so that class of bug cannot recur --
+which is why the tests that used to pin the endpoint string are gone rather than
+ported. See :data:`~sivacor_autoscaler.signals.JOB_COLLECTION`.
 """
 
 import pytest
 
 from sivacor_autoscaler.signals import (
-    JOB_LIST_ENDPOINT,
     READY_KEY_PREFIX,
+    SUBMISSION_TYPE,
     ready_instance_ids,
     serving_count,
     spent_instance_ids,
 )
 
 
-class FakeGirder:
-    def __init__(self, jobs):
-        self.jobs = jobs
-        self.calls = []
+class FakeCursor:
+    """Just enough of pymongo's cursor to record the query and yield documents."""
 
-    def get(self, path, parameters=None):
-        self.calls.append((path, parameters))
-        return self.jobs
+    def __init__(self, docs, calls):
+        self._docs, self._calls = docs, calls
+
+    def sort(self, key, direction):
+        self._calls.append(("sort", key, direction))
+        return self
+
+    def limit(self, n):
+        self._calls.append(("limit", n))
+        return self
+
+    def __iter__(self):
+        return iter(self._docs)
+
+
+class FakeCollection:
+    def __init__(self, docs, raises=False):
+        self.docs, self.raises, self.calls = docs, raises, []
+
+    def find(self, query, projection=None):
+        if self.raises:
+            raise RuntimeError("mongo down")
+        self.calls.append(("find", query, projection))
+        return FakeCursor(self.docs, self.calls)
+
+    def count_documents(self, query):
+        if self.raises:
+            raise RuntimeError("mongo down")
+        self.calls.append(("count", query))
+        return len(self.docs)
+
+
+class FakeGirder:
+    """Stands in for the Girder database: ``db[collection]``."""
+
+    def __init__(self, jobs, raises=False):
+        self.collection = FakeCollection(jobs, raises)
+
+    def __getitem__(self, name):
+        return self.collection
+
+    @property
+    def calls(self):
+        return self.collection.calls
 
 
 def job(queue=None, **meta):
@@ -76,55 +118,21 @@ def test_duplicate_claims_collapse():
     assert spent_instance_ids(client) == frozenset({"uuid-a"})
 
 
-def test_query_is_bounded_and_scoped():
-    """An unbounded job scan would grow without limit over a pilot's lifetime."""
+def test_query_is_bounded_scoped_and_newest_first():
+    """Unbounded would grow forever; unsorted would scan the wrong end of history."""
     client = FakeGirder([])
     spent_instance_ids(client)
-    _, params = client.calls[0]
+    kinds = {c[0]: c for c in client.calls}
 
-    assert params["types"] == '["sivacor_submission"]'
-    assert params["limit"] > 0
+    assert kinds["find"][1] == {"type": SUBMISSION_TYPE}
+    assert kinds["sort"][1:] == ("created", -1), "oldest-first would miss live workers"
+    assert kinds["limit"][1] > 0
 
 
 def test_girder_failure_propagates():
     """Returning an empty set would read as 'every worker is available'."""
-
-    class Broken:
-        def get(self, *a, **kw):
-            raise RuntimeError("girder down")
-
     with pytest.raises(RuntimeError):
-        spent_instance_ids(Broken())
-
-
-# -- the endpoint ---------------------------------------------------------------
-#
-# These look trivial and are not. Both signals asked `GET /job` until 2026-08-02,
-# which defaults `userId` to the authenticated user and so returned `[]` -- every
-# worker looked available and every submission looked idle, with a 200 and no error
-# anywhere. The controller could then only create capacity when the fleet was empty,
-# and one submission waited 18 min 09 s. An earlier revision of the first test below
-# asserted `path == "job"`, pinning the bug rather than catching it.
-
-
-def test_spent_reads_the_all_users_endpoint():
-    """Submissions are owned by researchers, not by the admin the controller uses."""
-    client = FakeGirder([])
-    spent_instance_ids(client)
-    path, _ = client.calls[0]
-
-    assert path == JOB_LIST_ENDPOINT
-    assert path == "job/all", "GET /job silently scopes to the authenticated user"
-
-
-def test_serving_reads_the_all_users_endpoint():
-    """The same trap, in the signal that was wrong for the controller's whole life."""
-    client = FakeGirder([])
-    serving_count(client)
-    path, _ = client.calls[0]
-
-    assert path == JOB_LIST_ENDPOINT
-    assert path == "job/all", "GET /job silently scopes to the authenticated user"
+        spent_instance_ids(FakeGirder([], raises=True))
 
 
 # -- serving_count --------------------------------------------------------------
@@ -140,21 +148,15 @@ def test_serving_filters_to_running_submissions():
     """Terminal submissions are not capacity, so the query must do the filtering."""
     client = FakeGirder([])
     serving_count(client)
-    _, params = client.calls[0]
+    _, query = client.calls[0]
 
-    assert params["types"] == '["sivacor_submission"]'
-    assert params["statuses"] == "[2]"
+    assert query == {"type": SUBMISSION_TYPE, "status": 2}
 
 
 def test_serving_failure_propagates():
     """Returning 0 would read as 'nothing is running' and could provoke a burst."""
-
-    class Broken:
-        def get(self, *a, **kw):
-            raise RuntimeError("girder down")
-
     with pytest.raises(RuntimeError):
-        serving_count(Broken())
+        serving_count(FakeGirder([], raises=True))
 
 
 # -- ready_instance_ids (D9) -----------------------------------------------------

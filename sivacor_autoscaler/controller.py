@@ -36,10 +36,12 @@ class Config:
 
 
 class Controller:
-    def __init__(self, conn, redis_client, girder_client, cfg: Config):
+    def __init__(self, conn, redis_client, db, cfg: Config):
         self.conn = conn
         self.redis = redis_client
-        self.girder = girder_client
+        #: Girder's MongoDB database. Read-only here; see signals.JOB_COLLECTION for
+        #: why this is the database rather than the REST API.
+        self.db = db
         self.cfg = cfg
         #: Consecutive instances that booted but never registered with celery. Reset
         #: by any successful round, so a transient failure does not accumulate towards
@@ -49,8 +51,8 @@ class Controller:
     def gather(self) -> FleetState:
         return FleetState(
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
-            serving=signals.serving_count(self.girder),
-            spent=signals.spent_instance_ids(self.girder, self.cfg.dispatch_queue),
+            serving=signals.serving_count(self.db),
+            spent=signals.spent_instance_ids(self.db, self.cfg.dispatch_queue),
             # Only read when the deadline check is armed. Skipping the call when it is
             # disabled keeps a Redis hiccup from failing rounds for a signal nothing
             # would have consulted -- gather() is all-or-nothing by design.

@@ -12,26 +12,30 @@ logger = logging.getLogger(__name__)
 #: Girder's numeric code for a RUNNING job (girder_jobs.constants.JobStatus.RUNNING).
 JOB_RUNNING = 2
 
-#: Girder endpoint for listing submissions. **Must be ``job/all``, never ``job``.**
+#: Girder's collection of job documents, and the field the plugin marks claims in.
+#: Read straight from MongoDB rather than over the REST API, for three reasons:
 #:
-#: ``GET /job`` defaults its ``userId`` parameter to the *authenticated* user
-#: (``girder_jobs/job_rest.py``: ``if not userId: user = currentUser``), and there is
-#: no spelling of that endpoint meaning "every user" -- an empty ``userId`` means the
-#: caller, ``"none"`` means jobs with no owner, and anything else is loaded as a user
-#: id. Submissions belong to the researcher who made them, not to the admin this
-#: controller authenticates as, so ``GET /job`` returns ``[]`` and every signal below
-#: reads as "nothing running, nothing spent".
+#: 1. **No credential to bootstrap.** The REST path needed an admin ``GIRDER_API_KEY``,
+#:    which cannot exist until after Girder is first started -- so a fresh deployment
+#:    could not bring the stack up in one pass. The controller is pinned to the manager
+#:    (it bind-mounts the worker template and clouds.yaml), so it is a peer of Mongo
+#:    exactly as ``local_worker`` is; the same reasoning retired ``GIRDER_API_KEY`` from
+#:    the housekeeping sweeps in P0.5.
+#: 2. **No endpoint semantics to get wrong.** ``GET /job`` defaults its ``userId`` to the
+#:    authenticated caller, and submissions belong to the researchers who made them --
+#:    so it returned ``200`` and ``[]`` on every tick, silently, for the controller's
+#:    entire life. That cost an 18 min 09 s stall before anyone noticed (plan run 5).
+#:    A query has no such hidden scoping.
+#: 3. **Reads only.** P0.5's warning about staying on HTTP applies to *writes*: failing a
+#:    submission has to fire ``jobs.job.update.after``, which is bound only in the Girder
+#:    server process. Nothing here writes, so that constraint does not bind.
 #:
-#: That failure is silent in the worst way: the request succeeds, ``200`` with an
-#: empty list, indistinguishable from a genuinely idle fleet. ``GET /job/all`` passes
-#: ``user='all'`` to the same model call and takes the same ``types`` / ``statuses`` /
-#: ``limit`` parameters; access filtering still applies by authenticated user, so an
-#: admin sees everything and no extra privilege is needed.
-#:
-#: Cost of getting this wrong, measured on the fifth loop test (2026-08-02): the
-#: controller could only create capacity when the fleet was *empty*, and one
-#: submission waited **18 min 09 s** for 18 s of work.
-JOB_LIST_ENDPOINT = "job/all"
+#: The cost is coupling to Girder's schema instead of its API. Mild: the collection and
+#: the ``type``/``status`` fields are stable, and ``meta.worker_queue`` is SIVACOR's own.
+JOB_COLLECTION = "job"
+
+#: Girder's job type for a submission, set by ``rest.py``'s ``submit_job``.
+SUBMISSION_TYPE = "sivacor_submission"
 
 
 def queue_depth(redis_client, queue: str) -> int:
@@ -47,7 +51,7 @@ def queue_depth(redis_client, queue: str) -> int:
     return depth
 
 
-def serving_count(girder_client) -> int:
+def serving_count(db) -> int:
     """Submissions currently executing.
 
     Load-bearing, not decorative: an ephemeral worker stops consuming the dispatch
@@ -55,23 +59,15 @@ def serving_count(girder_client) -> int:
     queue and must be counted separately or the fleet deadlocks. See
     :func:`plan.decide`.
 
-    Read from Girder rather than by broadcasting ``celery inspect``: a broadcast is
-    slow, needs every worker to answer, and silently under-reports when one is
-    wedged -- which is precisely when the number matters.
-
-    A permanent ``0`` here means the endpoint, not an idle fleet: see
-    :data:`JOB_LIST_ENDPOINT`.
+    Read from Girder's database rather than by broadcasting ``celery inspect``: a
+    broadcast is slow, needs every worker to answer, and silently under-reports when
+    one is wedged -- which is precisely when the number matters. See
+    :data:`JOB_COLLECTION` for why it is the database and not the REST API.
     """
     try:
-        jobs = girder_client.get(
-            JOB_LIST_ENDPOINT,
-            parameters={
-                "types": '["sivacor_submission"]',
-                "statuses": f"[{JOB_RUNNING}]",
-                "limit": 0,
-            },
+        return db[JOB_COLLECTION].count_documents(
+            {"type": SUBMISSION_TYPE, "status": JOB_RUNNING}
         )
-        return len(jobs)
     except Exception:
         # Returning 0 here would look like "nothing is running" and could provoke a
         # burst of instances, so refuse to guess and let the caller skip the round.
@@ -123,7 +119,7 @@ def ready_instance_ids(redis_client) -> frozenset[str]:
     return frozenset(ready)
 
 
-def spent_instance_ids(girder_client, queue_prefix: str = "sivacor") -> frozenset[str]:
+def spent_instance_ids(db, queue_prefix: str = "sivacor") -> frozenset[str]:
     """Instance ids that have already claimed a submission, and so are spent.
 
     An ephemeral worker stops consuming the dispatch queue the instant it accepts a
@@ -136,18 +132,22 @@ def spent_instance_ids(girder_client, queue_prefix: str = "sivacor") -> frozense
     ``sivacor.<instance-uuid>`` (``worker-cloud-init.sh``), so the marker
     ``prepare_submission`` writes to ``meta.worker_queue`` names the instance.
 
-    Read from Girder rather than ``celery inspect active_queues``, which would answer
-    the same question over the broker. A worker whose broker connection has died
-    cannot answer a broadcast -- and that is exactly the situation where this number
-    decides whether a submission gets an instance. The marker is written once, by the
-    worker, at claim time; nothing has to be reachable afterwards for it to stay true.
+    Read from Girder's database rather than ``celery inspect active_queues``, which
+    would answer the same question over the broker. A worker whose broker connection
+    has died cannot answer a broadcast -- and that is exactly the situation where this
+    number decides whether a submission gets an instance. The marker is written once,
+    by the worker, at claim time; nothing has to be reachable afterwards for it to
+    stay true. See :data:`JOB_COLLECTION` for why it is the database, not the API.
 
-    A permanently empty result means the endpoint, not an available fleet: see
-    :data:`JOB_LIST_ENDPOINT`.
+    Newest first and bounded: only *live* instances matter and there are at most
+    ``max_instances`` of them, so the scan window only has to be deep enough to cover
+    the submissions they are working on.
     """
-    jobs = girder_client.get(
-        JOB_LIST_ENDPOINT,
-        parameters={"types": '["sivacor_submission"]', "limit": CLAIM_SCAN_LIMIT},
+    jobs = (
+        db[JOB_COLLECTION]
+        .find({"type": SUBMISSION_TYPE}, {"meta.worker_queue": 1})
+        .sort("created", -1)
+        .limit(CLAIM_SCAN_LIMIT)
     )
     prefix = f"{queue_prefix}."
     spent = {
