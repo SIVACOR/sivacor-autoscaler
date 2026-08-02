@@ -12,6 +12,27 @@ logger = logging.getLogger(__name__)
 #: Girder's numeric code for a RUNNING job (girder_jobs.constants.JobStatus.RUNNING).
 JOB_RUNNING = 2
 
+#: Girder endpoint for listing submissions. **Must be ``job/all``, never ``job``.**
+#:
+#: ``GET /job`` defaults its ``userId`` parameter to the *authenticated* user
+#: (``girder_jobs/job_rest.py``: ``if not userId: user = currentUser``), and there is
+#: no spelling of that endpoint meaning "every user" -- an empty ``userId`` means the
+#: caller, ``"none"`` means jobs with no owner, and anything else is loaded as a user
+#: id. Submissions belong to the researcher who made them, not to the admin this
+#: controller authenticates as, so ``GET /job`` returns ``[]`` and every signal below
+#: reads as "nothing running, nothing spent".
+#:
+#: That failure is silent in the worst way: the request succeeds, ``200`` with an
+#: empty list, indistinguishable from a genuinely idle fleet. ``GET /job/all`` passes
+#: ``user='all'`` to the same model call and takes the same ``types`` / ``statuses`` /
+#: ``limit`` parameters; access filtering still applies by authenticated user, so an
+#: admin sees everything and no extra privilege is needed.
+#:
+#: Cost of getting this wrong, measured on the fifth loop test (2026-08-02): the
+#: controller could only create capacity when the fleet was *empty*, and one
+#: submission waited **18 min 09 s** for 18 s of work.
+JOB_LIST_ENDPOINT = "job/all"
+
 
 def queue_depth(redis_client, queue: str) -> int:
     """Submissions published to ``queue`` that no worker has taken yet.
@@ -37,10 +58,13 @@ def serving_count(girder_client) -> int:
     Read from Girder rather than by broadcasting ``celery inspect``: a broadcast is
     slow, needs every worker to answer, and silently under-reports when one is
     wedged -- which is precisely when the number matters.
+
+    A permanent ``0`` here means the endpoint, not an idle fleet: see
+    :data:`JOB_LIST_ENDPOINT`.
     """
     try:
         jobs = girder_client.get(
-            "job",
+            JOB_LIST_ENDPOINT,
             parameters={
                 "types": '["sivacor_submission"]',
                 "statuses": f"[{JOB_RUNNING}]",
@@ -80,9 +104,12 @@ def spent_instance_ids(girder_client, queue_prefix: str = "sivacor") -> frozense
     cannot answer a broadcast -- and that is exactly the situation where this number
     decides whether a submission gets an instance. The marker is written once, by the
     worker, at claim time; nothing has to be reachable afterwards for it to stay true.
+
+    A permanently empty result means the endpoint, not an available fleet: see
+    :data:`JOB_LIST_ENDPOINT`.
     """
     jobs = girder_client.get(
-        "job",
+        JOB_LIST_ENDPOINT,
         parameters={"types": '["sivacor_submission"]', "limit": CLAIM_SCAN_LIMIT},
     )
     prefix = f"{queue_prefix}."
