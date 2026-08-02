@@ -17,15 +17,21 @@ def inst(name, status="ACTIVE", age=timedelta(minutes=5)):
     return Instance(id=f"id-{name}", name=name, status=status, created_at=NOW - age)
 
 
-def state(depth=0, serving=0, instances=(), failures=0, spent=()):
+def state(depth=0, serving=0, instances=(), failures=0, spent=(), ready=()):
     return FleetState(
         queue_depth=depth,
         serving=serving,
         instances=tuple(instances),
         spent=frozenset(f"id-{n}" for n in spent),
+        ready=frozenset(f"id-{n}" for n in ready),
         consecutive_failures=failures,
         now=NOW,
     )
+
+
+#: Limits with the D9 check armed. The production default is None (off), so every
+#: test that wants the behaviour has to ask for it explicitly -- which is the point.
+D9 = Limits(provision_deadline=timedelta(minutes=10))
 
 
 def test_scale_from_zero():
@@ -188,3 +194,81 @@ def test_every_decision_is_explained():
     """Decisions are logged verbatim; a number with no reason is unauditable."""
     d = decide(state(depth=2, serving=1, instances=[inst("w1")]), LIMITS)
     assert d.reasons and all(r.strip() for r in d.reasons)
+
+
+# -- D9: instances that never provisioned ----------------------------------------
+#
+# Run 6 (2026-08-02): a VM lost the dpkg-lock race, aborted cloud-init under `set -e`
+# before its systemd units were written, and so came up with neither celery nor a
+# self-shutdown supervisor. It was ACTIVE, could never work, could never reclaim
+# itself, and -- being neither spent nor serving -- was counted as available capacity
+# for the whole run, stalling a submission behind it.
+
+
+def test_unprovisioned_instance_is_reaped_and_not_counted_as_capacity():
+    """The run-6 phantom: past the deadline, no readiness marker, nothing claimed."""
+    dead = inst("dead", age=timedelta(minutes=30))
+    d = decide(state(depth=1, instances=[dead]), D9)
+
+    assert d.delete == ("id-dead",)
+    # ...and a replacement is created in the same round, because the corpse no longer
+    # absorbs the shortfall. Both halves matter: reaping alone would still stall.
+    assert d.create == 1
+    assert any("no readiness marker" in r for r in d.reasons)
+
+
+def test_ready_instance_is_normal_capacity():
+    ready = inst("ready", age=timedelta(minutes=30))
+    d = decide(state(depth=1, instances=[ready], ready=["ready"]), D9)
+
+    assert d.delete == ()
+    assert d.create == 0
+
+
+def test_instance_inside_the_deadline_is_left_alone():
+    """Still booting is not the same as failed; boot->ready measured 122-140 s."""
+    booting = inst("booting", age=timedelta(minutes=3))
+    d = decide(state(depth=1, instances=[booting]), D9)
+
+    assert d.delete == ()
+    assert d.create == 0
+
+
+def test_spent_instance_is_never_written_off_even_without_a_marker():
+    """A claimed submission is positive proof celery worked.
+
+    The readiness write is best-effort on the worker side, so an observed claim is
+    the stronger signal and must win. Reaping here would kill a running submission.
+    """
+    working = inst("working", age=timedelta(minutes=30))
+    d = decide(state(depth=0, instances=[working], spent=["working"]), D9)
+
+    assert d.delete == ()
+
+
+def test_check_is_off_by_default():
+    """Arming it against an image that does not announce would delete the fleet.
+
+    The default must therefore be inert, not merely conservative -- this is the
+    rollout-ordering hazard, and the only thing standing between a stale worker
+    image and a controller that reaps every healthy instance it has.
+    """
+    unmarked = inst("unmarked", age=timedelta(hours=2))
+    d = decide(state(depth=0, instances=[unmarked]), Limits())
+
+    assert d.delete == ()
+
+
+def test_unprovisioned_and_over_lifetime_is_deleted_once():
+    """Both rules match; asking OpenStack to delete it twice 404s on the second."""
+    ancient = inst("ancient", age=timedelta(hours=40))
+    d = decide(state(instances=[ancient]), D9)
+
+    assert d.delete == ("id-ancient",)
+
+
+def test_unprovisioned_count_is_reported():
+    dead = inst("dead", age=timedelta(minutes=30))
+    d = decide(state(depth=1, instances=[dead]), D9)
+
+    assert any("1 unprovisioned" in r for r in d.reasons)

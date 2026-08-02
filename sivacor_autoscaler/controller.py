@@ -51,6 +51,14 @@ class Controller:
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.girder),
             spent=signals.spent_instance_ids(self.girder, self.cfg.dispatch_queue),
+            # Only read when the deadline check is armed. Skipping the call when it is
+            # disabled keeps a Redis hiccup from failing rounds for a signal nothing
+            # would have consulted -- gather() is all-or-nothing by design.
+            ready=(
+                signals.ready_instance_ids(self.redis)
+                if self.cfg.limits.provision_deadline is not None
+                else frozenset()
+            ),
             instances=fleet.list_fleet(self.conn),
             consecutive_failures=self.consecutive_failures,
         )

@@ -86,6 +86,43 @@ def serving_count(girder_client) -> int:
 CLAIM_SCAN_LIMIT = 100
 
 
+#: Redis key prefix the worker plugin writes readiness markers under. Must match
+#: ``girder_sivacor.worker_plugin.run_submission.READY_KEY_PREFIX``.
+READY_KEY_PREFIX = "sivacor:ready:"
+
+
+def ready_instance_ids(redis_client) -> frozenset[str]:
+    """Instances whose celery worker started and reached the broker (plan D9).
+
+    An instance that boots but fails to provision is neither *spent* nor *serving*,
+    so without this it reads as available capacity forever -- and it cannot reclaim
+    itself either, because the self-shutdown supervisor is written by the same
+    script that failed. Measured 2026-08-02: one lost dpkg-lock race stranded a VM
+    for a whole run and stalled a submission behind it.
+
+    The marker is written once, from the worker's ``worker_ready`` handler, so its
+    presence means celery actually started *and* connected -- strictly stronger than
+    "the provisioning script finished", which a wrong docker GID or a bad broker
+    password would satisfy with a dead worker.
+
+    **Raises rather than returning an empty set on failure.** Empty means "no
+    instance has ever registered", which past the boot deadline is a licence to
+    delete the entire fleet -- so a Redis blip must skip the round, not act on a
+    guess. Same reasoning as :func:`serving_count`, with more at stake.
+    """
+    try:
+        keys = redis_client.keys(f"{READY_KEY_PREFIX}*")
+    except Exception:
+        logger.warning("Could not read readiness markers from Redis", exc_info=True)
+        raise
+    ready = {
+        (k.decode() if isinstance(k, bytes) else k)[len(READY_KEY_PREFIX):]
+        for k in keys
+    }
+    logger.debug("ready instances (celery registered): %s", sorted(ready))
+    return frozenset(ready)
+
+
 def spent_instance_ids(girder_client, queue_prefix: str = "sivacor") -> frozenset[str]:
     """Instance ids that have already claimed a submission, and so are spent.
 

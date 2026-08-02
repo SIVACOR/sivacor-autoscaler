@@ -50,6 +50,22 @@ class Limits:
     #: it a broken image loops forever, burning ~8 SU/hr per stuck instance.
     breaker_threshold: int = 3
 
+    #: How long an instance may take to announce readiness before it is written off
+    #: as failed to provision: excluded from available capacity, then deleted (D9).
+    #:
+    #: **``None`` disables the check entirely, and that is the default on purpose.**
+    #: Enabling it against a worker image that does not write readiness markers
+    #: deletes every healthy instance the moment it passes the deadline -- the same
+    #: rollout-ordering hazard as P4.5's tro-utils floor. Turn it on only once the
+    #: deployed image is known to announce, and confirm with
+    #: ``redis-cli KEYS 'sivacor:ready:*'`` after one worker has come up.
+    #:
+    #: Sizing: boot->ready has measured 122-140 s across five runs, so 10 minutes is
+    #: roughly 4x margin. The asymmetry favours generosity -- deleting a healthy but
+    #: slow instance costs one boot (~2.5 min) and the submission is re-created for,
+    #: while keeping a dead one costs a stalled submission plus up to 30 h of SUs.
+    provision_deadline: timedelta | None = None
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -63,6 +79,10 @@ class FleetState:
     #: longer consume the dispatch queue. Empty is safe: the arithmetic degrades to
     #: the older, stall-prone ``depth + serving`` estimate rather than misbehaving.
     spent: frozenset[str] = frozenset()
+    #: Ids of instances whose celery worker started and reached the broker (D9).
+    #: Only consulted when :attr:`Limits.provision_deadline` is set; see there for
+    #: why that switch defaults to off.
+    ready: frozenset[str] = frozenset()
     #: Consecutive instances that came up but never registered with celery.
     consecutive_failures: int = 0
     now: datetime | None = None
@@ -119,31 +139,74 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     live = [i for i in state.instances if i.is_live]
     now = state.now or datetime.now(tz=_tz_of(live))
 
+    # --- instances that never provisioned (D9) -----------------------------
+    # A VM that boots but fails to provision never claims and never serves, so
+    # without this it reads as available capacity forever -- and it cannot power
+    # itself off either, because the supervisor is written by the script that
+    # failed. Absence of a readiness marker past a boot deadline is what separates
+    # that from "still booting" and from "healthy and idle".
+    failed_to_provision: set[str] = set()
+    if limits.provision_deadline is not None:
+        for inst in live:
+            # A spent instance is never written off, whatever the markers say: it
+            # claimed a submission, which is positive proof its celery worked. The
+            # readiness write is best-effort on the worker side, so trusting it over
+            # an observed claim would be trusting the weaker signal.
+            if inst.created_at is None or inst.id in state.ready or inst.id in state.spent:
+                continue
+            if now - inst.created_at > limits.provision_deadline:
+                failed_to_provision.add(inst.id)
+
     # --- deletes -----------------------------------------------------------
     delete: list[str] = []
+    seen: set[str] = set()
+
+    def _reap(inst, why: str) -> None:
+        # Guarded against double-listing: an instance can be both over the lifetime
+        # ceiling and unprovisioned, and asking OpenStack to delete it twice turns a
+        # tidy reap into a 404 on the second call.
+        if inst.id in seen:
+            return
+        seen.add(inst.id)
+        delete.append(inst.id)
+        reasons.append(f"reap {inst.name}: {why}")
+
     for inst in state.instances:
         if inst.status == "SHUTOFF":
-            delete.append(inst.id)
-            reasons.append(f"reap {inst.name}: SHUTOFF, work finished")
+            _reap(inst, "SHUTOFF, work finished")
     for inst in live:
+        if inst.id in failed_to_provision:
+            _reap(
+                inst,
+                f"live for {now - inst.created_at} with no readiness marker, past "
+                f"the {limits.provision_deadline} provisioning deadline; it can "
+                "neither work nor reclaim itself",
+            )
         if inst.created_at is None:
             continue
         age = now - inst.created_at
         if age > limits.max_lifetime:
-            delete.append(inst.id)
-            reasons.append(
-                f"reap {inst.name}: live for {age}, over the "
-                f"{limits.max_lifetime} ceiling; supervisor did not fire"
+            _reap(
+                inst,
+                f"live for {age}, over the {limits.max_lifetime} ceiling; "
+                "supervisor did not fire",
             )
 
     # --- creates -----------------------------------------------------------
     # Instances remaining after this round's deletions still occupy their slots
     # until OpenStack actually removes them, so count conservatively against the cap.
-    available = [i for i in live if i.id not in state.spent]
+    available = [
+        i for i in live if i.id not in state.spent and i.id not in failed_to_provision
+    ]
     shortfall = state.queue_depth - len(available)
     headroom = limits.max_instances - len(live)
     create = max(0, min(shortfall, headroom))
-    spent_live = len(live) - len(available)
+    spent_live = len([i for i in live if i.id in state.spent])
+    # Surfaced only when non-zero: on a healthy fleet it is noise on every tick, and
+    # when it is non-zero it is the first thing worth seeing.
+    dead = (
+        f", {len(failed_to_provision)} unprovisioned" if failed_to_provision else ""
+    )
 
     if state.consecutive_failures >= limits.breaker_threshold:
         if create:
@@ -155,7 +218,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     elif shortfall <= 0:
         reasons.append(
             f"no new instances: depth={state.queue_depth}, {len(available)} "
-            f"available of {len(live)} live ({spent_live} spent, "
+            f"available of {len(live)} live ({spent_live} spent{dead}, "
             f"serving={state.serving})"
         )
     elif create < shortfall:
@@ -169,7 +232,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     else:
         reasons.append(
             f"create {create}: depth={state.queue_depth}, only {len(available)} "
-            f"available of {len(live)} live ({spent_live} spent, "
+            f"available of {len(live)} live ({spent_live} spent{dead}, "
             f"serving={state.serving})"
         )
 

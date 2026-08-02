@@ -12,6 +12,8 @@ import pytest
 
 from sivacor_autoscaler.signals import (
     JOB_LIST_ENDPOINT,
+    READY_KEY_PREFIX,
+    ready_instance_ids,
     serving_count,
     spent_instance_ids,
 )
@@ -153,3 +155,52 @@ def test_serving_failure_propagates():
 
     with pytest.raises(RuntimeError):
         serving_count(Broken())
+
+
+# -- ready_instance_ids (D9) -----------------------------------------------------
+
+
+class FakeRedis:
+    def __init__(self, keys, raises=False):
+        self._keys, self._raises = keys, raises
+        self.patterns = []
+
+    def keys(self, pattern):
+        self.patterns.append(pattern)
+        if self._raises:
+            raise ConnectionError("redis down")
+        return self._keys
+
+
+def test_ready_extracts_instance_ids():
+    r = FakeRedis([f"{READY_KEY_PREFIX}uuid-a", f"{READY_KEY_PREFIX}uuid-b"])
+
+    assert ready_instance_ids(r) == frozenset({"uuid-a", "uuid-b"})
+
+
+def test_ready_handles_bytes_keys():
+    """redis-py returns bytes unless the client was built with decode_responses.
+
+    Getting this wrong produced a live outage once already -- the log relay shipped
+    bytes into send_text and died inside uvicorn (P1.3 finding 7).
+    """
+    r = FakeRedis([f"{READY_KEY_PREFIX}uuid-a".encode()])
+
+    assert ready_instance_ids(r) == frozenset({"uuid-a"})
+
+
+def test_ready_scans_only_the_marker_namespace():
+    r = FakeRedis([])
+    ready_instance_ids(r)
+
+    assert r.patterns == [f"{READY_KEY_PREFIX}*"]
+
+
+def test_ready_failure_propagates():
+    """An empty set past the deadline is a licence to delete the whole fleet.
+
+    So a Redis blip must skip the round rather than be mistaken for "nothing has
+    ever registered" -- the same reasoning as serving_count, with more at stake.
+    """
+    with pytest.raises(ConnectionError):
+        ready_instance_ids(FakeRedis([], raises=True))

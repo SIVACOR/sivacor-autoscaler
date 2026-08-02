@@ -44,6 +44,14 @@ def build_config() -> Config:
             max_instances=int(_env("SIVACOR_MAX_INSTANCES", "5")),
             max_lifetime=timedelta(hours=float(_env("SIVACOR_MAX_LIFETIME_HOURS", "30"))),
             breaker_threshold=int(_env("SIVACOR_BREAKER_THRESHOLD", "3")),
+            # Unset = the D9 check is off, which is the safe default: arming it
+            # against a worker image that does not write readiness markers deletes
+            # healthy instances. See Limits.provision_deadline.
+            provision_deadline=(
+                timedelta(minutes=float(mins))
+                if (mins := _env("SIVACOR_PROVISION_DEADLINE_MINUTES"))
+                else None
+            ),
         ),
     )
 
@@ -104,6 +112,23 @@ def main() -> int:
             "SIVACOR_OS_KEYPAIR is unset: workers launch with NO ssh key. A worker "
             "that fails to power itself off is then diagnosable only from "
             "`openstack console log show` and the broker."
+        )
+
+    # Same reasoning as the keypair warning: state it once, up front. Off is the safe
+    # default but it is also the state in which run 6's phantom recurs, so a silent
+    # default here would be the second time this project shipped an inert signal.
+    if cfg.limits.provision_deadline is not None:
+        logging.getLogger(__name__).info(
+            "unprovisioned instances are reaped after %s; requires a worker image "
+            "that announces readiness (plan D9)",
+            cfg.limits.provision_deadline,
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "SIVACOR_PROVISION_DEADLINE_MINUTES is unset: an instance that boots but "
+            "fails to provision will be counted as available capacity until the %s "
+            "max-lifetime sweep, stalling submissions behind it (plan D9).",
+            cfg.limits.max_lifetime,
         )
 
     import openstack
