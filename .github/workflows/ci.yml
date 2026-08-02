@@ -1,0 +1,72 @@
+name: CI
+
+# Tests and the image live in one workflow on purpose: `docker` declares
+# `needs: test`, so a build that would push a broken controller never runs.
+# Cross-workflow gating is not expressible in Actions, and this is the component
+# whose bugs cost allocation in one direction and stall submissions in the other.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: pip install -e ".[test]" ruff
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q
+
+  docker:
+    needs: test
+    # Forks cannot read the registry secrets, and a PR build would push nothing
+    # anyway. Push events only.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tagging policy, and it is deliberate rather than incidental.
+      #
+      # `latest` moves ONLY on main. The branch tag always moves, so `distributed`
+      # tracks the `distributed` branch -- the same convention worker-cloud-init.sh
+      # uses for WORKER_IMAGE, which is what makes "worker and manager are the same
+      # build" checkable rather than assumed.
+      #
+      # The immutable sha- tag is the important one: docker-stack.yml resolves
+      # ${SIVACOR_AUTOSCALER_IMAGE}, so a deployment can pin a digest and merging to
+      # main stops being the same decision as deploying. girder-sivacor's workflow
+      # pushes only `latest` from main, and the stack defaults to `latest` -- so the
+      # merge itself arms production. That is the P0.3 failure mode; do not repeat it
+      # here.
+      - name: Compute tags
+        id: tags
+        run: |
+          branch="${GITHUB_REF_NAME//\//-}"
+          tags="${branch},sha-${GITHUB_SHA::7}"
+          [ "${GITHUB_REF}" = "refs/heads/main" ] && tags="${tags},latest"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "will push: ${tags}"
+
+      - name: Build and push
+        uses: mr-smithers-excellent/docker-build-push@v6
+        with:
+          image: xarthisius/sivacor-autoscaler
+          tags: ${{ steps.tags.outputs.tags }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          enableBuildKit: true
+          multiPlatform: false
