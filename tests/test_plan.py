@@ -17,11 +17,12 @@ def inst(name, status="ACTIVE", age=timedelta(minutes=5)):
     return Instance(id=f"id-{name}", name=name, status=status, created_at=NOW - age)
 
 
-def state(depth=0, serving=0, instances=(), failures=0):
+def state(depth=0, serving=0, instances=(), failures=0, spent=()):
     return FleetState(
         queue_depth=depth,
         serving=serving,
         instances=tuple(instances),
+        spent=frozenset(f"id-{n}" for n in spent),
         consecutive_failures=failures,
         now=NOW,
     )
@@ -38,18 +39,49 @@ def test_nothing_queued_nothing_created():
     assert any("no new instances" in r for r in d.reasons)
 
 
-def test_busy_instances_do_not_absorb_the_queue():
+def test_spent_instances_do_not_absorb_the_queue():
     """
-    The deadlock the `serving` term exists to prevent.
+    The deadlock the spent/available distinction exists to prevent.
 
-    Two instances are executing submissions. Because an ephemeral worker drops its
+    Two instances have claimed submissions. Because an ephemeral worker drops its
     dispatch-queue consumer the moment it accepts one (P3.2), neither will ever take
     the queued third -- and both power off when done. A naive `depth - live` gives
     -1, creates nothing, and that submission waits forever.
     """
-    d = decide(state(depth=1, serving=2, instances=[inst("w1"), inst("w2")]), LIMITS)
+    d = decide(
+        state(
+            depth=1, serving=2, instances=[inst("w1"), inst("w2")], spent=["w1", "w2"]
+        ),
+        LIMITS,
+    )
 
-    assert d.create == 1, "a queued submission with only busy workers must scale up"
+    assert d.create == 1, "a queued submission with only spent workers must scale up"
+
+
+def test_finished_but_not_yet_powered_off_does_not_block_creation():
+    """
+    The stall this replaced ``depth + serving`` to fix (D8 option C, P3.5).
+
+    Measured 2026-08-01: a worker finished its submission and sat waiting out the
+    boot grace plus idle clock. It was neither serving nor available, but still
+    ``live`` -- so ``depth(1) + serving(0) = 1`` against ``1 live`` created nothing
+    and the next submission waited 4 min 45 s. Alone it would have waited ~13 min.
+    """
+    spent_and_idle = inst("w1")
+    d = decide(
+        state(depth=1, serving=0, instances=[spent_and_idle], spent=["w1"]), LIMITS
+    )
+
+    assert d.create == 1, "a spent-but-alive worker must not count as capacity"
+    assert any("1 spent" in r for r in d.reasons)
+
+
+def test_available_instances_are_not_double_counted():
+    """The other direction: an idle worker that has claimed nothing will take the work."""
+    d = decide(state(depth=1, instances=[inst("w1")]), LIMITS)
+
+    assert d.create == 0
+    assert any("1 available" in r for r in d.reasons)
 
 
 def test_booting_instances_are_not_double_counted():
@@ -63,7 +95,8 @@ def test_booting_instances_are_not_double_counted():
 def test_cap_is_respected_and_says_so():
     """A cap that throttles silently is indistinguishable from a broken controller."""
     live = [inst(f"w{i}") for i in range(5)]
-    d = decide(state(depth=4, serving=5, instances=live), LIMITS)
+    spent = [f"w{i}" for i in range(5)]
+    d = decide(state(depth=4, serving=5, instances=live, spent=spent), LIMITS)
 
     assert d.create == 0
     assert any("CAPPED" in r for r in d.reasons)
@@ -72,7 +105,8 @@ def test_cap_is_respected_and_says_so():
 
 def test_partial_cap_creates_what_it_can():
     live = [inst(f"w{i}") for i in range(4)]
-    d = decide(state(depth=3, serving=4, instances=live), LIMITS)
+    spent = [f"w{i}" for i in range(4)]
+    d = decide(state(depth=3, serving=4, instances=live, spent=spent), LIMITS)
     assert d.create == 1  # one slot left of five
 
 

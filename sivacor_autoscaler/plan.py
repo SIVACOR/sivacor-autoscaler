@@ -55,9 +55,14 @@ class Limits:
 class FleetState:
     #: Submissions published to the dispatch queue that no worker has taken yet.
     queue_depth: int
-    #: Submissions currently executing. Load-bearing -- see :func:`decide`.
+    #: Submissions currently executing. Reported for observability; the creation
+    #: arithmetic uses :attr:`spent` instead -- see :func:`decide`.
     serving: int
     instances: tuple[Instance, ...] = ()
+    #: Ids of instances that have already claimed a submission and therefore no
+    #: longer consume the dispatch queue. Empty is safe: the arithmetic degrades to
+    #: the older, stall-prone ``depth + serving`` estimate rather than misbehaving.
+    spent: frozenset[str] = frozenset()
     #: Consecutive instances that came up but never registered with celery.
     consecutive_failures: int = 0
     now: datetime | None = None
@@ -75,23 +80,36 @@ class Decision:
 def decide(state: FleetState, limits: Limits) -> Decision:
     """Return the create/delete actions the fleet needs.
 
-    **Why ``serving`` is not optional.** The tempting formula is
+    **Count available instances, not all live ones.** The tempting formula is
     ``create = depth - live``: never over-provision, since live instances will pick up
     the queue. That deadlocks. An ephemeral worker drops its consumer on the dispatch
-    queue the moment it accepts a submission (P3.2), so a *busy* instance will never
-    take another one -- and it powers off when done. With two busy instances and one
+    queue the moment it accepts a submission (P3.2), so a *spent* instance will never
+    take another one -- and it powers off when done. With two spent instances and one
     queued submission, ``depth - live`` is ``-1``, the controller creates nothing, and
-    nothing will ever pick that submission up. Counting the busy ones separately is
-    what avoids that:
+    nothing ever picks that submission up.
 
-        desired = depth + serving      # what the fleet must eventually cover
-        create  = desired - live       # clamped to the cap
+    The original fix estimated around it with ``desired = depth + serving``, which
+    deadlocked less but still stalled: ``serving`` counts submissions *executing*, and
+    an instance that has finished its submission but not yet powered off is neither
+    serving nor available, yet still counts as ``live``. Measured 2026-08-01: a
+    submission waited **4 min 45 s** behind exactly that, and would have waited ~13 min
+    had a later submission not bumped the depth (D8, P3.5).
 
-    **Treat this as accurate, not exact.** ``cancel_consumer`` is asynchronous and
-    submissions are acked on receipt, so a worker can occasionally take a second one.
-    That self-corrects -- the extra submission runs after the first, and the next loop
-    sees the truth -- but it means the arithmetic is a good estimator rather than an
-    invariant, and nothing downstream should assume one submission per instance.
+    So ask the question directly instead of estimating it::
+
+        available = live instances that have NOT claimed a submission
+        create    = depth - available          # clamped to the cap
+
+    ``spent`` comes from a marker the worker writes to Girder when it claims a
+    submission, not from a broker broadcast -- see :func:`signals.spent_instance_ids`
+    for why that distinction matters.
+
+    **Treat this as accurate, not exact.** A worker that becomes ready while two or
+    more submissions are queued takes *two*: celery delivers them in one prefetch,
+    milliseconds after startup and before ``cancel_consumer`` can run. The spare
+    instance simply idles and is reaped, so this over-provisions slightly rather than
+    stalling -- the safe direction. Nothing downstream may assume one submission per
+    instance.
 
     **Deletes are never gated on the breaker.** A tripped breaker means "stop spending
     money", so continuing to reap is the whole point; skipping it would leak the very
@@ -121,10 +139,11 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     # --- creates -----------------------------------------------------------
     # Instances remaining after this round's deletions still occupy their slots
     # until OpenStack actually removes them, so count conservatively against the cap.
-    desired = state.queue_depth + state.serving
-    shortfall = desired - len(live)
+    available = [i for i in live if i.id not in state.spent]
+    shortfall = state.queue_depth - len(available)
     headroom = limits.max_instances - len(live)
     create = max(0, min(shortfall, headroom))
+    spent_live = len(live) - len(available)
 
     if state.consecutive_failures >= limits.breaker_threshold:
         if create:
@@ -135,8 +154,9 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         create = 0
     elif shortfall <= 0:
         reasons.append(
-            f"no new instances: depth={state.queue_depth} + serving={state.serving} "
-            f"= {desired}, already {len(live)} live"
+            f"no new instances: depth={state.queue_depth}, {len(available)} "
+            f"available of {len(live)} live ({spent_live} spent, "
+            f"serving={state.serving})"
         )
     elif create < shortfall:
         # Not an error: the queue simply waits. Logged loudly because a cap that
@@ -148,8 +168,9 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         )
     else:
         reasons.append(
-            f"create {create}: depth={state.queue_depth} + serving={state.serving} "
-            f"= {desired} needed, {len(live)} live"
+            f"create {create}: depth={state.queue_depth}, only {len(available)} "
+            f"available of {len(live)} live ({spent_live} spent, "
+            f"serving={state.serving})"
         )
 
     return Decision(create=create, delete=tuple(delete), reasons=tuple(reasons))

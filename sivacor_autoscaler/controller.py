@@ -50,6 +50,7 @@ class Controller:
         return FleetState(
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.girder),
+            spent=signals.spent_instance_ids(self.girder, self.cfg.dispatch_queue),
             instances=fleet.list_fleet(self.conn),
             consecutive_failures=self.consecutive_failures,
         )

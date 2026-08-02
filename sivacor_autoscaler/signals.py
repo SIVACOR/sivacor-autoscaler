@@ -53,3 +53,44 @@ def serving_count(girder_client) -> int:
         # burst of instances, so refuse to guess and let the caller skip the round.
         logger.warning("Could not read running submissions from Girder", exc_info=True)
         raise
+
+
+#: How many recent submissions to scan for worker claims. Only *live* instances
+#: matter, there are at most ``max_instances`` of them, and each takes one or two
+#: submissions, so a few dozen is already generous. Bounded because this runs every
+#: tick and an unbounded job scan would grow without limit over a pilot's lifetime.
+CLAIM_SCAN_LIMIT = 100
+
+
+def spent_instance_ids(girder_client, queue_prefix: str = "sivacor") -> frozenset[str]:
+    """Instance ids that have already claimed a submission, and so are spent.
+
+    An ephemeral worker stops consuming the dispatch queue the instant it accepts a
+    submission, and powers off when finished. Counting such an instance as capacity
+    is what made the controller refuse to create the instance a queued submission
+    needed -- a 4 min 45 s stall observed 2026-08-01, and ~13 min had a later
+    submission not happened to bump the queue depth. See :func:`plan.decide`.
+
+    The mapping is direct because a worker's private queue is named
+    ``sivacor.<instance-uuid>`` (``worker-cloud-init.sh``), so the marker
+    ``prepare_submission`` writes to ``meta.worker_queue`` names the instance.
+
+    Read from Girder rather than ``celery inspect active_queues``, which would answer
+    the same question over the broker. A worker whose broker connection has died
+    cannot answer a broadcast -- and that is exactly the situation where this number
+    decides whether a submission gets an instance. The marker is written once, by the
+    worker, at claim time; nothing has to be reachable afterwards for it to stay true.
+    """
+    jobs = girder_client.get(
+        "job",
+        parameters={"types": '["sivacor_submission"]', "limit": CLAIM_SCAN_LIMIT},
+    )
+    prefix = f"{queue_prefix}."
+    spent = {
+        queue[len(prefix):]
+        for job in jobs
+        if (queue := (job.get("meta") or {}).get("worker_queue"))
+        and queue.startswith(prefix)
+    }
+    logger.debug("spent instances (claimed a submission): %s", sorted(spent))
+    return frozenset(spent)
