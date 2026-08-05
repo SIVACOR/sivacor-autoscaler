@@ -16,10 +16,12 @@ from .controller import Config, Controller
 from .plan import Limits, decide
 
 
-def _env(name: str, default: str | None = None, required: bool = False) -> str | None:
+def _env(
+    name: str, default: str | None = None, required: bool = False, hint: str = ""
+) -> str | None:
     value = os.environ.get(name, default)
     if required and not value:
-        sys.exit(f"{name} must be set")
+        sys.exit(f"{name} must be set{hint}")
     return value
 
 
@@ -33,7 +35,23 @@ def build_config() -> Config:
         # namespace, and the failure that produces -- each controller counting and
         # reaping the other's workers -- is silent. See fleet.DEPLOYMENT_TAG_PREFIX.
         # The stack passes the deployment's `domain`.
-        deployment=_env("SIVACOR_DEPLOYMENT", required=True),
+        #
+        # Being required also makes this image and the stack file a matched pair: a
+        # deployment that takes the new image with an old `docker-stack.autoscaler.yml`
+        # gets a container that exits here and, under `restart_policy: any`, crash-loops
+        # -- which means NO controller, so nothing scales and nothing is reaped. Loud in
+        # `docker service logs wt_autoscaler` and invisible everywhere else, so the
+        # message has to name the fix. Same shape as P0.3's plugin/stack pairing.
+        deployment=_env(
+            "SIVACOR_DEPLOYMENT",
+            required=True,
+            hint=(
+                ", normally the deployment domain (e.g. sivacor.org). It scopes which "
+                "OpenStack instances this controller owns; deploy-sivacor's Makefile "
+                "derives it from `domain`, so if you are seeing this, the stack file is "
+                "older than this image -- update deploy-sivacor and redeploy together."
+            ),
+        ),
         dispatch_queue=_env("SIVACOR_DISPATCH_QUEUE", "sivacor"),
         girder_host=_env("SIVACOR_GIRDER_HOST"),
         worker_image=_env("SIVACOR_WORKER_IMAGE"),
