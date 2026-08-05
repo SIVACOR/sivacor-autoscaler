@@ -23,6 +23,11 @@ class Config:
     manager_ip: str
     master_key_hex: str
     redis_password: str
+    #: Which deployment this controller owns, tagged onto every instance it creates and
+    #: required of every instance it will touch. See fleet.DEPLOYMENT_TAG_PREFIX: the
+    #: test mirror and production share one OpenStack project, so without this each
+    #: controller counts and reaps the other's workers.
+    deployment: str
     dispatch_queue: str = "sivacor"
     girder_host: str | None = None
     worker_image: str | None = None
@@ -47,12 +52,53 @@ class Controller:
         #: by any successful round, so a transient failure does not accumulate towards
         #: the breaker.
         self.consecutive_failures = 0
+        #: Instances observed to have claimed a submission, remembered for as long as
+        #: OpenStack still reports them. See :meth:`_spent`.
+        self._spent_seen: set[str] = set()
+
+    def _spent(self, instances) -> frozenset[str]:
+        """Instance ids that have claimed a submission, monotonically.
+
+        ``signals.spent_instance_ids`` derives the set from surviving Girder job
+        documents, and **a user can delete those**: ``DELETE /sivacor/submission/:id``
+        calls ``Job().remove()``, which erases the ``meta.worker_queue`` marker the
+        signal is made of. Deletion is only allowed once a submission is *completed* --
+        but an ephemeral worker lives on for the boot grace plus its idle clock, ~15
+        min, and the submission is deletable for all of it.
+
+        Observed in production 2026-08-05: a submission was deleted at 15:06:54, its
+        instance dropped out of ``spent`` on the same tick, and the fleet then reported
+        ``1 available of 1 live`` for 12 min 36 s -- for a worker that had already
+        cancelled its dispatch-queue consumer at claim time (P3.2) and was counting
+        down to poweroff. A submission arriving in that window computes
+        ``depth - available == 0``, gets no instance, and nothing consumes it: the run
+        3 / run 5 stall class, reached through a path no loop test exercised.
+
+        A claim is irreversible, so remembering it is sound: an instance that has taken
+        a submission will never take another. Retention is bounded by the fleet itself
+        -- ids OpenStack no longer reports are dropped, which also discards the
+        ``sivacor.static-01`` style entries the signal yields for the manager's own
+        static worker, since those never match an instance id.
+
+        **The memory is per process.** A controller restart while a spent worker is
+        still winding down re-opens the same window until that instance is reaped. The
+        durable fix is a claim marker in Redis alongside D9's readiness marker, which
+        no Girder deletion can touch -- but that is a ``girder-sivacor`` change and so
+        a worker-image change, and the fleet currently rides a tag CI no longer builds.
+        """
+        known = {i.id for i in instances}
+        self._spent_seen |= signals.spent_instance_ids(self.db, self.cfg.dispatch_queue)
+        self._spent_seen &= known
+        return frozenset(self._spent_seen)
 
     def gather(self) -> FleetState:
+        # Instances first: _spent() prunes against them, and an id OpenStack no longer
+        # reports must not linger in the cache.
+        instances = fleet.list_fleet(self.conn, self.cfg.deployment)
         return FleetState(
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
-            spent=signals.spent_instance_ids(self.db, self.cfg.dispatch_queue),
+            spent=self._spent(instances),
             # Only read when the deadline check is armed. Skipping the call when it is
             # disabled keeps a Redis hiccup from failing rounds for a signal nothing
             # would have consulted -- gather() is all-or-nothing by design.
@@ -61,7 +107,7 @@ class Controller:
                 if self.cfg.limits.provision_deadline is not None
                 else frozenset()
             ),
-            instances=fleet.list_fleet(self.conn),
+            instances=instances,
             consecutive_failures=self.consecutive_failures,
         )
 
@@ -115,7 +161,8 @@ class Controller:
 
     def run(self) -> None:
         logger.info(
-            "controller starting: queue=%s cap=%d interval=%.0fs",
+            "controller starting: deployment=%s queue=%s cap=%d interval=%.0fs",
+            self.cfg.deployment,
             self.cfg.dispatch_queue,
             self.cfg.limits.max_instances,
             self.cfg.interval,

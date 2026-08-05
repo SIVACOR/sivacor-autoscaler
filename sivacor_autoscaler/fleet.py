@@ -21,7 +21,39 @@ logger = logging.getLogger(__name__)
 #: Instances carry this tag so the fleet can be found without relying on names.
 FLEET_TAG = "sivacor-worker"
 
+#: Prefix of the second, per-deployment tag. **Both tags are required** to consider an
+#: instance ours.
+#:
+#: ``FLEET_TAG`` alone is not enough, and the reason is not hypothetical. Production
+#: and the test mirror run their own controller against the **same OpenStack project**
+#: (D3: one 25-instance allocation carries the manager, the mirror and any debug VM),
+#: so a single shared tag makes each controller see the other's workers as its own:
+#:
+#: * ``spent`` and ``ready`` come from *this* deployment's Mongo and Redis, so a
+#:   foreign worker is in neither -- it therefore counts as **available capacity**
+#:   (:func:`plan.decide`), a queued submission gets no instance, and it stalls until
+#:   the foreign VM disappears. Precisely run 6's phantom, arriving by cross-talk.
+#: * every foreign ``SHUTOFF`` instance is reaped by whichever controller ticks first,
+#:   and with D9 armed the foreign *live* ones are deleted at the deadline, since they
+#:   can never appear in the local ready set.
+#:
+#: Kept out of :data:`FLEET_TAG` rather than folded into it so that an instance from a
+#: deployment that predates this scoping is still recognisably fleet -- see
+#: :func:`list_fleet`, which reports it rather than silently ignoring it.
+DEPLOYMENT_TAG_PREFIX = "sivacor-deployment:"
+
 INJECT_MARKER = "#__SIVACOR_INJECT__"
+
+#: Foreign instance ids already reported, so the notice below fires once per instance
+#: per process rather than every 30 s tick. Module state is ugly; a per-tick warning
+#: for an 18-minute foreign worker is 36 identical lines, and silence is worse than
+#: both -- an instance nothing will ever reap has to be visible somewhere.
+_FOREIGN_REPORTED: set[str] = set()
+
+
+def deployment_tag(deployment: str) -> str:
+    """The per-deployment tag for ``deployment`` (typically the stack's ``domain``)."""
+    return f"{DEPLOYMENT_TAG_PREFIX}{deployment}"
 
 #: Nova's ceiling on the base64-encoded user_data blob.
 USER_DATA_LIMIT = 65535
@@ -76,15 +108,36 @@ def build_user_data(
     return text.replace(INJECT_MARKER, "\n".join(lines))
 
 
-def list_fleet(conn) -> tuple[Instance, ...]:
-    """Every worker instance, whatever its state.
+def list_fleet(conn, deployment: str) -> tuple[Instance, ...]:
+    """Every worker instance of ``deployment``, whatever its state.
 
     SHUTOFF ones matter as much as live ones: they are what the reap step exists for,
     and an unreaped instance holds a slot against the quota.
+
+    **Filtering is on both tags**, for the reasons under
+    :data:`DEPLOYMENT_TAG_PREFIX`. An instance carrying :data:`FLEET_TAG` but a
+    different deployment tag -- or none, i.e. booted before this scoping existed -- is
+    skipped and *reported*: this controller must not touch it, but something has to
+    say so, because an instance no controller claims is one nothing will ever reap.
     """
+    wanted = deployment_tag(deployment)
     out = []
     for s in conn.compute.servers(details=True):
-        if FLEET_TAG not in (s.tags or []):
+        tags = set(s.tags or ())
+        if FLEET_TAG not in tags:
+            continue
+        if wanted not in tags:
+            if s.id not in _FOREIGN_REPORTED:
+                _FOREIGN_REPORTED.add(s.id)
+                foreign = sorted(t for t in tags if t.startswith(DEPLOYMENT_TAG_PREFIX))
+                logger.info(
+                    "ignoring %s (%s): tagged %s, not %s. Another deployment owns it "
+                    "-- or nobody does, if that list is empty",
+                    s.name or s.id,
+                    s.id,
+                    foreign or "no deployment",
+                    wanted,
+                )
             continue
         out.append(
             Instance(
@@ -119,8 +172,13 @@ def create_instance(conn, cfg, user_data: str) -> str:
         # only the higher-level conn.create_server() encodes, and that one would
         # allocate a floating IP, which workers must not have.
         "user_data": encoded,
-        "tags": [FLEET_TAG],
-        "metadata": {"sivacor_role": "worker"},
+        # Both tags, always. list_fleet() requires both, so an instance created with
+        # only FLEET_TAG would be invisible to its own controller: never counted, never
+        # reaped, and holding a quota slot until a human noticed.
+        "tags": [FLEET_TAG, deployment_tag(cfg.deployment)],
+        # Metadata rather than tags for the human-facing copy: `openstack server show`
+        # prints properties in full, which is where anyone debugging looks first.
+        "metadata": {"sivacor_role": "worker", "sivacor_deployment": cfg.deployment},
     }
     if cfg.key_name:
         kwargs["key_name"] = cfg.key_name

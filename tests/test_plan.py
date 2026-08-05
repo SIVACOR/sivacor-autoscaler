@@ -173,12 +173,17 @@ def test_naive_timestamps_do_not_raise():
 
     The server-side reaper hit exactly this, so it is worth an explicit test rather
     than a comment.
+
+    ``created_at`` is relative to real time on purpose: ``now=None`` is the whole point
+    of the case, so a hardcoded date silently becomes older than ``max_lifetime`` as the
+    wall clock advances and the instance starts getting reaped for age instead. This
+    test began failing on 2026-08-02, 30 h after the date it used to pin.
     """
     naive = Instance(
         id="n",
         name="n",
         status="ACTIVE",
-        created_at=datetime(2026, 8, 1, 11, 0, tzinfo=timezone.utc),
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
     )
     d = decide(
         FleetState(queue_depth=0, serving=0, instances=(naive,), now=None), LIMITS

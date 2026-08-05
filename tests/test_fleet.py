@@ -6,6 +6,7 @@ busiest, and the only symptom is submissions queueing behind an idle controller.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,6 +79,87 @@ class _Err(Exception):
 )
 def test_quota_errors_are_distinguished_from_real_failures(exc, expected):
     assert fleet._is_quota_error(exc) is expected
+
+
+class _Server:
+    def __init__(self, id, tags, status="ACTIVE", name=None):
+        self.id, self.tags, self.status = id, tags, status
+        self.name = name or id
+        self.created_at = "2026-08-05T15:00:00Z"
+
+
+class _Conn:
+    """Just enough of an openstacksdk connection for listing and creating."""
+
+    def __init__(self, servers=()):
+        self.servers_ = list(servers)
+        self.created = []
+        self.compute = self
+        self.network = self
+
+    def servers(self, details=True):
+        return list(self.servers_)
+
+    def find_image(self, name, ignore_missing=True):
+        return _Server("image-id", [])
+
+    def find_flavor(self, name, ignore_missing=True):
+        return _Server("flavor-id", [])
+
+    def find_network(self, name, ignore_missing=True):
+        return _Server("net-id", [])
+
+    def create_server(self, **kwargs):
+        self.created.append(kwargs)
+        return _Server("new-id", [])
+
+
+OURS = fleet.deployment_tag("test.sivacor.org")
+THEIRS = fleet.deployment_tag("sivacor.org")
+
+
+def test_only_this_deployments_instances_are_listed():
+    """
+    The whole point: production and the mirror share one OpenStack project.
+
+    Seeing a foreign instance is not cosmetic -- it is counted as available capacity
+    (its claim marker lives in the *other* deployment's Girder), so a queued submission
+    gets no VM, and every foreign SHUTOFF one is reaped by whoever ticks first.
+    """
+    conn = _Conn(
+        [
+            _Server("mine", [fleet.FLEET_TAG, OURS]),
+            _Server("theirs", [fleet.FLEET_TAG, THEIRS]),
+            _Server("legacy", [fleet.FLEET_TAG]),
+            _Server("unrelated", []),
+        ]
+    )
+
+    assert [i.id for i in fleet.list_fleet(conn, "test.sivacor.org")] == ["mine"]
+
+
+def test_a_created_instance_carries_both_tags():
+    """
+    With only FLEET_TAG it would be invisible to its own controller.
+
+    Never counted, never reaped, holding a quota slot until a human noticed -- strictly
+    worse than the cross-talk this scoping fixes.
+    """
+    conn = _Conn()
+    cfg = SimpleNamespace(
+        deployment="test.sivacor.org",
+        image="img",
+        flavor="m3.medium",
+        network="net",
+        key_name=None,
+        security_groups=[],
+    )
+
+    fleet.create_instance(conn, cfg, "#!/bin/bash\n")
+    tags = conn.created[0]["tags"]
+
+    assert fleet.FLEET_TAG in tags and OURS in tags
+    assert conn.created[0]["metadata"]["sivacor_deployment"] == "test.sivacor.org"
 
 
 def test_timestamp_parsing_tolerates_z_suffix():

@@ -29,6 +29,11 @@ def build_config() -> Config:
         manager_ip=_env("SIVACOR_MANAGER_TENANT_IP", required=True),
         master_key_hex=_env("MASTER_KEY_HEX", required=True),
         redis_password=_env("REDIS_PASSWORD", required=True),
+        # Required, deliberately. Defaulting it would put two deployments in one tag
+        # namespace, and the failure that produces -- each controller counting and
+        # reaping the other's workers -- is silent. See fleet.DEPLOYMENT_TAG_PREFIX.
+        # The stack passes the deployment's `domain`.
+        deployment=_env("SIVACOR_DEPLOYMENT", required=True),
         dispatch_queue=_env("SIVACOR_DISPATCH_QUEUE", "sivacor"),
         girder_host=_env("SIVACOR_GIRDER_HOST"),
         worker_image=_env("SIVACOR_WORKER_IMAGE"),
@@ -98,6 +103,17 @@ def main() -> int:
     cfg = build_config()
     if not cfg.template.is_file():
         sys.exit(f"worker template not found: {cfg.template}")
+
+    # Worth a line at INFO: this is the value that decides which instances the process
+    # will create, count and *delete*, and the one mistake it protects against -- two
+    # deployments sharing a project -- is invisible from inside either one.
+    from . import fleet as _fleet
+
+    logging.getLogger(__name__).info(
+        "owning instances tagged %r; ignoring every other %r instance",
+        _fleet.deployment_tag(cfg.deployment),
+        _fleet.FLEET_TAG,
+    )
 
     # Not fatal -- a keyless fleet is a legitimate production posture, and workers
     # hold no key material worth reaching for. But it is a terrible *debugging*
