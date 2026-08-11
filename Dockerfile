@@ -25,9 +25,14 @@ COPY pyproject.toml README.md ./
 COPY sivacor_autoscaler ./sivacor_autoscaler
 RUN pip install --no-cache-dir .
 
-# Runs as a non-root uid with no write access to anything that matters. This
-# container creates and destroys VMs; it has no reason to be root, and nothing it
-# touches is on a host filesystem it owns. Both bind mounts are read-only.
+# Runs as a non-root uid. This container creates and destroys VMs; it has no reason
+# to be root. The credential mounts (clouds.yaml, worker-cloud-init.sh) are read-only.
+#
+# The one writable mount is SIVACOR_DIAGNOSTICS_DIR, where a pre-delete post-mortem
+# is written. **The host directory must be writable by uid 1000**, or capture fails --
+# logged as a warning, never fatal, so the symptom is an empty directory rather than a
+# broken controller. On the JS2 managers `ubuntu` happens to be uid 1000; do not rely
+# on that silently, chown it.
 RUN useradd --create-home --uid 1000 autoscaler
 USER autoscaler
 

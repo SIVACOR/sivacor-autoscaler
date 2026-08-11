@@ -200,6 +200,68 @@ def delete_instance(conn, instance_id: str) -> None:
     logger.info("deleted %s", instance_id)
 
 
+#: Fields of a Nova server that are never written to a diagnostics dump. ``user_data``
+#: is the whole reason this list exists: it is base64, not encryption, and one decode
+#: yields MASTER_KEY_HEX and REDIS_PASSWORD in cleartext (P2.2). The same mistake --
+#: a debugging aid becoming a secret sink -- already reached a shared log on
+#: 2026-08-01 via keystoneauth's request-body logging.
+REDACTED_SERVER_FIELDS = ("user_data", "personality", "adminPass", "admin_password")
+
+
+def server_details(conn, instance_id: str) -> dict | None:
+    """Everything Nova knows about an instance, minus its credentials.
+
+    ``fault`` is the field worth the round trip: when the hypervisor kills an
+    instance, that is where it says so, and it is unreachable once the server is
+    deleted. ``vm_state``/``power_state``/``task_state`` separate "guest powered
+    itself off" from "someone called stop".
+    """
+    try:
+        server = conn.compute.get_server(instance_id)
+    except Exception:
+        logger.warning("could not read details of %s", instance_id, exc_info=True)
+        return None
+    try:
+        raw = server.to_dict()
+    except Exception:
+        logger.warning("could not serialise %s; falling back", instance_id, exc_info=True)
+        raw = {k: getattr(server, k, None) for k in ("id", "name", "status", "fault")}
+    return {k: v for k, v in raw.items() if k not in REDACTED_SERVER_FIELDS}
+
+
+def server_actions(conn, instance_id: str) -> list[dict]:
+    """Nova's action log for an instance: create, stop, reboot, delete.
+
+    The point of asking is what is *absent*. A guest that ran ``systemctl poweroff``
+    leaves no action, so a SHUTOFF instance whose log shows only ``create`` powered
+    itself off; one showing ``stop`` was stopped through the API by something else.
+    """
+    try:
+        return [a.to_dict() for a in conn.compute.server_actions(instance_id)]
+    except Exception:
+        logger.warning("could not read actions of %s", instance_id, exc_info=True)
+        return []
+
+
+def console_log(conn, instance_id: str, length: int | None = None) -> str | None:
+    """The instance's serial console buffer, or ``None`` if it cannot be read.
+
+    This is the only post-mortem a fleet worker has. It has no floating IP, so ssh is
+    out even with a keypair; its journal dies with the disk; and the idle supervisor
+    logs to ``journal+console`` (``worker-cloud-init.sh``) precisely so its
+    BUSY/UNREACHABLE/POWERING OFF decisions land here. Nova drops the buffer with the
+    server, so this must be read *before* :func:`delete_instance`, never after.
+    """
+    try:
+        out = conn.compute.get_server_console_output(instance_id, length=length)
+    except Exception:
+        logger.warning("could not read console log of %s", instance_id, exc_info=True)
+        return None
+    if isinstance(out, dict):
+        return out.get("output")
+    return getattr(out, "output", None)
+
+
 def _require(finder, name, what):
     found = finder(name, ignore_missing=True)
     if found is None:

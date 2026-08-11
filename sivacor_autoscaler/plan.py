@@ -11,6 +11,7 @@ do, and executes the answer.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -28,6 +29,23 @@ class Instance:
     def is_live(self) -> bool:
         """Booting or running, i.e. occupying an instance slot."""
         return self.status in ("BUILD", "ACTIVE")
+
+
+@dataclass(frozen=True)
+class RunningJob:
+    """A submission Girder still believes is executing on a given instance.
+
+    Carried purely so a reap can be *described* correctly. It changes no arithmetic:
+    a SHUTOFF instance is deleted either way, because leaving it costs a quota slot
+    and the submission is already unrecoverable -- its workspace died with the VM.
+    What it changes is whether the operator can tell the two cases apart afterwards.
+    """
+
+    id: str
+    #: ``meta.heartbeat``, the server's liveness signal. The gap between this and the
+    #: poweroff is the whole diagnosis: ~17 min means the worker's idle supervisor
+    #: powered the VM off after 8 unreachable ticks, i.e. celery died under a live run.
+    heartbeat: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,10 @@ class FleetState:
     ready: frozenset[str] = frozenset()
     #: Consecutive instances that came up but never registered with celery.
     consecutive_failures: int = 0
+    #: Instance id -> the submission Girder still has RUNNING on it. Diagnostics only;
+    #: an empty mapping degrades every reap message to its old, less specific wording
+    #: and nothing else. See :func:`signals.running_jobs_by_instance`.
+    running_jobs: Mapping[str, RunningJob] = field(default_factory=dict)
     now: datetime | None = None
 
 
@@ -95,6 +117,20 @@ class Decision:
     #: Human-readable justification for every number above. Logged verbatim: this is
     #: the component whose decisions need to be auditable after the fact.
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    #: A **subset of** :attr:`reasons`: the ones describing a fleet that is not
+    #: behaving as designed, and so deserving WARNING rather than INFO. A severity view
+    #: rather than a separate bucket, so :attr:`reasons` stays the complete audit trail
+    #: it is documented to be, and the normal chatter -- one "no new instances" line
+    #: every 30 s -- still cannot bury an anomaly.
+    alerts: tuple[str, ...] = field(default_factory=tuple)
+    #: Ids whose deletion destroys evidence worth keeping: capture before deleting.
+    #: A worker VM is the only place its own journal and console buffer exist, and
+    #: ``delete_server`` is irreversible, so this is the last moment either can be read.
+    abnormal: frozenset[str] = frozenset()
+    #: Instance id -> why it is being reaped, the same text as in :attr:`reasons` or
+    #: :attr:`alerts` without the ``reap <name>:`` prefix. Carried by id so the caller
+    #: does not have to recover the association by parsing log lines back apart.
+    reap_reasons: Mapping[str, str] = field(default_factory=dict)
 
 
 def decide(state: FleetState, limits: Limits) -> Decision:
@@ -136,6 +172,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     instances that tripped it.
     """
     reasons: list[str] = []
+    alerts: list[str] = []
     live = [i for i in state.instances if i.is_live]
     now = state.now or datetime.now(tz=_tz_of(live))
 
@@ -160,8 +197,10 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     # --- deletes -----------------------------------------------------------
     delete: list[str] = []
     seen: set[str] = set()
+    abnormal: set[str] = set()
+    reap_reasons: dict[str, str] = {}
 
-    def _reap(inst, why: str) -> None:
+    def _reap(inst, why: str, *, alarming: bool = False) -> None:
         # Guarded against double-listing: an instance can be both over the lifetime
         # ceiling and unprovisioned, and asking OpenStack to delete it twice turns a
         # tidy reap into a 404 on the second call.
@@ -169,10 +208,33 @@ def decide(state: FleetState, limits: Limits) -> Decision:
             return
         seen.add(inst.id)
         delete.append(inst.id)
-        reasons.append(f"reap {inst.name}: {why}")
+        reap_reasons[inst.id] = why
+        line = f"reap {inst.name}: {why}"
+        reasons.append(line)
+        if alarming:
+            alerts.append(line)
+            abnormal.add(inst.id)
 
     for inst in state.instances:
-        if inst.status == "SHUTOFF":
+        if inst.status != "SHUTOFF":
+            continue
+        # "SHUTOFF, work finished" was this branch's only wording until 2026-08-11,
+        # and it was an unchecked assumption. Three production submissions were reaped
+        # for no heartbeat on 2026-08-10/11; in all three the worker had powered itself
+        # off *mid-run* (celery unreachable for 8 ticks) and this loop deleted it ~17
+        # min after the last heartbeat, logging "work finished" over the top. Since a
+        # delete also destroys the console buffer and the journal, that one word was
+        # the difference between a diagnosable failure and an unexplainable one.
+        if job := state.running_jobs.get(inst.id):
+            _reap(
+                inst,
+                f"SHUTOFF while submission {job.id} is still RUNNING"
+                f"{_since(job.heartbeat, now)}. The worker did NOT finish its work: "
+                "it powered off under a live run, so its own logs are the only record "
+                "of why -- capture them before this delete",
+                alarming=True,
+            )
+        else:
             _reap(inst, "SHUTOFF, work finished")
     for inst in live:
         if inst.id in failed_to_provision:
@@ -181,6 +243,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
                 f"live for {now - inst.created_at} with no readiness marker, past "
                 f"the {limits.provision_deadline} provisioning deadline; it can "
                 "neither work nor reclaim itself",
+                alarming=True,
             )
         if inst.created_at is None:
             continue
@@ -190,6 +253,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
                 inst,
                 f"live for {age}, over the {limits.max_lifetime} ceiling; "
                 "supervisor did not fire",
+                alarming=True,
             )
 
     # --- creates -----------------------------------------------------------
@@ -236,7 +300,30 @@ def decide(state: FleetState, limits: Limits) -> Decision:
             f"serving={state.serving})"
         )
 
-    return Decision(create=create, delete=tuple(delete), reasons=tuple(reasons))
+    return Decision(
+        create=create,
+        delete=tuple(delete),
+        reasons=tuple(reasons),
+        alerts=tuple(alerts),
+        abnormal=frozenset(abnormal),
+        reap_reasons=reap_reasons,
+    )
+
+
+def _since(heartbeat, now) -> str:
+    """`` (last heartbeat 0:17:12 ago)``, or nothing if there is no heartbeat.
+
+    Naive/aware mismatches are possible here in a way they are not for instance
+    timestamps: ``meta.heartbeat`` comes back from pymongo naive by default, while
+    ``now`` follows OpenStack and is aware. Subtracting those raises -- the same trap
+    ``_tz_of`` exists for, and one that must not be allowed to break a reap.
+    """
+    if heartbeat is None:
+        return ""
+    try:
+        return f" (last heartbeat {now - heartbeat} ago)"
+    except TypeError:
+        return f" (last heartbeat {heartbeat.isoformat()})"
 
 
 def _tz_of(live):

@@ -63,6 +63,13 @@ def build_config() -> Config:
             g for g in (_env("SIVACOR_OS_SECGROUPS", "") or "").split(",") if g
         ],
         interval=float(_env("SIVACOR_INTERVAL", "30")),
+        # Unset = no capture, which is the pre-2026-08-11 behaviour rather than a
+        # neutral default: without it an instance that powered off mid-run is deleted
+        # with its console buffer, and nothing anywhere records why it died. Set it to
+        # a bind-mounted path -- a directory inside the container dies with it.
+        diagnostics_dir=(
+            Path(d) if (d := _env("SIVACOR_DIAGNOSTICS_DIR")) else None
+        ),
         limits=Limits(
             max_instances=int(_env("SIVACOR_MAX_INSTANCES", "5")),
             max_lifetime=timedelta(hours=float(_env("SIVACOR_MAX_LIFETIME_HOURS", "30"))),
@@ -146,6 +153,22 @@ def main() -> int:
             "SIVACOR_OS_KEYPAIR is unset: workers launch with NO ssh key. A worker "
             "that fails to power itself off is then diagnosable only from "
             "`openstack console log show` and the broker."
+        )
+
+    # Third of the same family: a capability that is off by default has to announce
+    # itself, or the first time anyone learns it was off is while trying to read the
+    # dump that was never written.
+    if cfg.diagnostics_dir:
+        logging.getLogger(__name__).info(
+            "pre-delete diagnostics go to %s; keep it bind-mounted and treat it as "
+            "secret-bearing (console buffers are uncurated)",
+            cfg.diagnostics_dir,
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "SIVACOR_DIAGNOSTICS_DIR is unset: an instance that powers off mid-run is "
+            "deleted along with the only copy of its console log, so 'reaped for no "
+            "heartbeat' will stay unexplainable. Observed three times on 2026-08-10/11."
         )
 
     # Same reasoning as the keypair warning: state it once, up front. Off is the safe

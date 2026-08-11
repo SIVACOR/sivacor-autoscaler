@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import fleet, signals
+from . import diagnostics, fleet, signals
 from .plan import FleetState, Limits, decide
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,11 @@ class Config:
     key_name: str | None = None
     security_groups: list[str] = field(default_factory=list)
     interval: float = 30.0
+    #: Where to write a post-mortem before deleting an instance that died badly.
+    #: ``None`` disables capture entirely -- the pre-2026-08-11 behaviour, where a
+    #: worker that powered off mid-run was deleted with no record of why. Point it at
+    #: a bind mount: a path inside the container dies with the container.
+    diagnostics_dir: Path | None = None
     limits: Limits = field(default_factory=Limits)
 
 
@@ -99,6 +104,12 @@ class Controller:
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
             spent=self._spent(instances),
+            # Diagnostics only, and it swallows its own errors: it must not be able to
+            # skip a round, because a round that does not happen is a round that does
+            # not reap.
+            running_jobs=signals.running_jobs_by_instance(
+                self.db, self.cfg.dispatch_queue
+            ),
             # Only read when the deadline check is armed. Skipping the call when it is
             # disabled keeps a Redis hiccup from failing rounds for a signal nothing
             # would have consulted -- gather() is all-or-nothing by design.
@@ -122,12 +133,29 @@ class Controller:
             return
 
         decision = decide(state, self.cfg.limits)
+        # alerts is a subset of reasons, so filter rather than log the anomalies twice.
+        alerts = set(decision.alerts)
         for reason in decision.reasons:
-            logger.info("%s", reason)
+            if reason not in alerts:
+                logger.info("%s", reason)
+        for alert in decision.alerts:
+            logger.warning("%s", alert)
+
+        by_id = {i.id: i for i in state.instances}
 
         # Deletes first: they free slots the creates may want, and they must happen
         # even when the breaker has blocked creation.
         for instance_id in decision.delete:
+            # Strictly before the delete: Nova drops the console buffer with the
+            # server, so this ordering is the entire value of the capture.
+            if instance_id in decision.abnormal and self.cfg.diagnostics_dir:
+                diagnostics.capture(
+                    self.conn,
+                    self.cfg.diagnostics_dir,
+                    by_id[instance_id],
+                    why=decision.reap_reasons.get(instance_id, "unrecorded"),
+                    job=state.running_jobs.get(instance_id),
+                )
             try:
                 fleet.delete_instance(self.conn, instance_id)
             except Exception:

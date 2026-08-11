@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 
+from .plan import RunningJob
+
 logger = logging.getLogger(__name__)
 
 #: Girder's numeric code for a RUNNING job (girder_jobs.constants.JobStatus.RUNNING).
@@ -158,3 +160,45 @@ def spent_instance_ids(db, queue_prefix: str = "sivacor") -> frozenset[str]:
     }
     logger.debug("spent instances (claimed a submission): %s", sorted(spent))
     return frozenset(spent)
+
+
+def running_jobs_by_instance(db, queue_prefix: str = "sivacor") -> dict[str, RunningJob]:
+    """Instance id -> the submission Girder still believes is executing on it.
+
+    Same ``meta.worker_queue`` join as :func:`spent_instance_ids`, narrowed to RUNNING
+    jobs. It answers the one question the reap step could not previously ask: *was
+    anyone still using this VM?* A SHUTOFF instance with a RUNNING submission on it is
+    a worker that died mid-run, not one that finished.
+
+    **Never raises, and an empty result is safe.** Unlike every other signal here this
+    one feeds no arithmetic -- it only decides how a reap is worded and whether the
+    console log is captured first. A controller that stopped reaping because a
+    *diagnostics* query failed would trade a leaked instance for a better error
+    message, which is the wrong trade. Callers get ``{}`` and the old behaviour.
+    """
+    try:
+        jobs = list(
+            db[JOB_COLLECTION]
+            .find(
+                {"type": SUBMISSION_TYPE, "status": JOB_RUNNING},
+                {"meta.worker_queue": 1, "meta.heartbeat": 1},
+            )
+            .sort("created", -1)
+            .limit(CLAIM_SCAN_LIMIT)
+        )
+    except Exception:
+        logger.warning("Could not read running submissions per instance", exc_info=True)
+        return {}
+
+    prefix = f"{queue_prefix}."
+    out: dict[str, RunningJob] = {}
+    for job in jobs:
+        meta = job.get("meta") or {}
+        queue = meta.get("worker_queue")
+        if not queue or not queue.startswith(prefix):
+            continue
+        out[queue[len(prefix):]] = RunningJob(
+            id=str(job.get("_id")), heartbeat=meta.get("heartbeat")
+        )
+    logger.debug("running submissions by instance: %s", sorted(out))
+    return out
