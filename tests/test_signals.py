@@ -11,6 +11,8 @@ which is why the tests that used to pin the endpoint string are gone rather than
 ported. See :data:`~sivacor_autoscaler.signals.JOB_COLLECTION`.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from sivacor_autoscaler.signals import (
@@ -19,6 +21,7 @@ from sivacor_autoscaler.signals import (
     ready_instance_ids,
     serving_count,
     spent_instance_ids,
+    unclaimed_submission_ages,
 )
 
 
@@ -206,3 +209,66 @@ def test_ready_failure_propagates():
     """
     with pytest.raises(ConnectionError):
         ready_instance_ids(FakeRedis([], raises=True))
+
+
+# --- unclaimed submission ages ---------------------------------------------
+
+
+def _job(minutes_old, *, aware=False, created=True):
+    """A RUNNING submission document with no claim on it."""
+    doc = {"_id": f"job-{minutes_old}"}
+    if created:
+        when = datetime.now(timezone.utc) - timedelta(minutes=minutes_old)
+        doc["created"] = when if aware else when.replace(tzinfo=None)
+    return doc
+
+
+def test_unclaimed_ages_measures_from_created():
+    db = FakeGirder([_job(5)])
+    (age,) = unclaimed_submission_ages(db)
+    assert timedelta(minutes=4) < age < timedelta(minutes=6)
+
+
+def test_unclaimed_ages_handles_naive_and_aware_alike():
+    """Girder stores naive UTC; a tz-aware document must not be mis-aged by 5 hours.
+
+    The whole reason this signal returns ages rather than timestamps -- doing the
+    subtraction here, where the convention is known, instead of in plan.decide()
+    where `now` may be naive local time.
+    """
+    naive, = unclaimed_submission_ages(FakeGirder([_job(10)]))
+    aware, = unclaimed_submission_ages(FakeGirder([_job(10, aware=True)]))
+    assert abs(naive - aware) < timedelta(seconds=5)
+
+
+def test_unclaimed_query_selects_running_and_unclaimed_only():
+    """Pins the null-equality match, which is load-bearing rather than incidental.
+
+    Verified against mongo:4.4: equality-to-null matches a missing field, an empty
+    ``meta`` and an explicit null, while ``{"$exists": False}`` -- the tempting way to
+    write this "properly" -- misses the explicit null and would hide exactly the kind
+    of unserved submission this signal exists to surface.
+    """
+    db = FakeGirder([_job(5)])
+    unclaimed_submission_ages(db)
+    (_, query, _), *_ = db.calls
+    assert query["type"] == SUBMISSION_TYPE
+    assert query["status"] == 2
+    assert query["meta.worker_queue"] is None
+    assert "$exists" not in repr(query["meta.worker_queue"])
+
+
+def test_unclaimed_skips_undateable_documents():
+    """An undateable job would otherwise read as infinitely old and provision forever."""
+    assert unclaimed_submission_ages(FakeGirder([_job(5, created=False)])) == ()
+
+
+def test_unclaimed_degrades_to_depth_only_rather_than_skipping_the_round():
+    """A broken query must not block reaps -- gather() is all-or-nothing.
+
+    Returning () can only under-provision, and the next tick retries; raising would
+    skip the whole round, and a round that does not happen is a round that does not
+    reap. See test_diagnostics.test_a_broken_diagnostics_query_still_reaps, which
+    fails if this ever starts raising again.
+    """
+    assert unclaimed_submission_ages(FakeGirder([], raises=True)) == ()

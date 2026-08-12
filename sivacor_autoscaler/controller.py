@@ -104,6 +104,12 @@ class Controller:
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
             spent=self._spent(instances),
+            # Demand that queue_depth structurally cannot see: a submission whose
+            # message a worker has reserved but cannot start is absent from the Redis
+            # list while being just as unserved. Swallows its own errors, like
+            # running_jobs_by_instance: it must not be able to skip a round, because a
+            # round that does not happen is a round that does not reap.
+            unclaimed_ages=signals.unclaimed_submission_ages(self.db),
             # Diagnostics only, and it swallows its own errors: it must not be able to
             # skip a round, because a round that does not happen is a round that does
             # not reap.

@@ -17,13 +17,22 @@ def inst(name, status="ACTIVE", age=timedelta(minutes=5)):
     return Instance(id=f"id-{name}", name=name, status=status, created_at=NOW - age)
 
 
-def state(depth=0, serving=0, instances=(), failures=0, spent=(), ready=()):
+def state(
+    depth=0,
+    serving=0,
+    instances=(),
+    failures=0,
+    spent=(),
+    ready=(),
+    unclaimed_ages=(),
+):
     return FleetState(
         queue_depth=depth,
         serving=serving,
         instances=tuple(instances),
         spent=frozenset(f"id-{n}" for n in spent),
         ready=frozenset(f"id-{n}" for n in ready),
+        unclaimed_ages=tuple(unclaimed_ages),
         consecutive_failures=failures,
         now=NOW,
     )
@@ -280,3 +289,67 @@ def test_unprovisioned_count_is_reported():
     d = decide(state(depth=1, instances=[dead]), D9)
 
     assert any("1 unprovisioned" in r for r in d.reasons)
+
+
+# --- unclaimed submissions: demand queue depth cannot see ------------------
+# Production 2026-08-12: a worker restarted mid-chain by the wedge supervisor
+# re-subscribed to the dispatch queue, reserved a submission it could not start, and
+# the controller read depth=0 with its only instance spent -- so it created nothing
+# and the submission sat untouched. Every input was correct except depth.
+
+STALE = timedelta(minutes=5)
+FRESH = timedelta(seconds=3)
+
+
+def test_unclaimed_submission_scales_up_when_depth_lost_it():
+    spent_and_busy = inst("w1")
+    d = decide(
+        state(depth=0, serving=1, instances=[spent_and_busy], spent=["w1"],
+              unclaimed_ages=[STALE]),
+        LIMITS,
+    )
+    assert d.create == 1, (
+        "a submission unclaimed for minutes must scale up even at depth=0: its "
+        "message is reserved by a worker that cannot start it"
+    )
+
+
+def test_unclaimed_alert_is_also_a_reason():
+    """`alerts` is documented as a severity view over `reasons`, not a second bucket."""
+    d = decide(state(depth=0, unclaimed_ages=[STALE]), LIMITS)
+    assert d.alerts, "a queue that lost sight of unserved work is an anomaly"
+    for a in d.alerts:
+        assert a in d.reasons, "every alert must remain in the audit trail"
+
+
+def test_unclaimed_within_grace_is_ignored():
+    """The gap between reserving a message and calling claim() is normal."""
+    d = decide(state(depth=0, unclaimed_ages=[FRESH]), LIMITS)
+    assert d.create == 0
+    assert not d.alerts
+
+
+def test_unclaimed_is_not_added_to_depth():
+    """A queued submission is *also* unclaimed; counting both provisions twice."""
+    d = decide(state(depth=1, unclaimed_ages=[STALE]), LIMITS)
+    assert d.create == 1, "max(depth, unclaimed), never depth + unclaimed"
+    assert not d.alerts, "depth already accounts for it, so nothing is anomalous"
+
+
+def test_unclaimed_does_not_double_provision_against_available_capacity():
+    d = decide(state(depth=0, instances=[inst("w1")], unclaimed_ages=[STALE]), LIMITS)
+    assert d.create == 0, "an idle available worker will take it; no new instance"
+
+
+def test_unclaimed_respects_the_breaker():
+    d = decide(
+        state(depth=0, unclaimed_ages=[STALE, STALE], failures=3),
+        LIMITS,
+    )
+    assert d.create == 0, "a tripped breaker must not be bypassed by a new signal"
+
+
+def test_unclaimed_absent_keeps_old_behaviour():
+    d = decide(state(depth=2), LIMITS)
+    assert d.create == 2
+    assert not d.alerts

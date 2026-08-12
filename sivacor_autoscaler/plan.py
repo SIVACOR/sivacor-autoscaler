@@ -84,6 +84,24 @@ class Limits:
     #: while keeping a dead one costs a stalled submission plus up to 30 h of SUs.
     provision_deadline: timedelta | None = None
 
+    #: How long a RUNNING submission may sit unclaimed before it counts as demand in
+    #: its own right, independently of queue depth. See
+    #: :attr:`FleetState.unclaimed_ages`.
+    #:
+    #: **The grace exists to skip one transient, not to be cautious.** A worker that
+    #: has just reserved the head task is briefly both absent from the queue and
+    #: unclaimed -- from the moment celery hands it the message to the moment
+    #: ``prepare_submission`` calls ``claim()``, a second or two. Counting that would
+    #: create an instance for a submission already being started, on every submit.
+    #: Anything comfortably past it is a genuine stall: nothing legitimately takes
+    #: minutes between reserving a message and claiming it, because ``claim()`` is
+    #: deliberately the first thing that task does.
+    #:
+    #: Two minutes is ~4 controller rounds at the 30 s tick, so a stall is corrected
+    #: in well under the 30 min the server-side reaper would take to fail the
+    #: submission outright.
+    unclaimed_grace: timedelta = timedelta(minutes=2)
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -101,6 +119,12 @@ class FleetState:
     #: Only consulted when :attr:`Limits.provision_deadline` is set; see there for
     #: why that switch defaults to off.
     ready: frozenset[str] = frozenset()
+    #: Age of every RUNNING submission that no worker has claimed -- demand that
+    #: :attr:`queue_depth` cannot see, because a reserved-but-unstarted message has
+    #: already left the Redis list. Ages rather than timestamps so no naive/aware
+    #: comparison happens here; see :func:`signals.unclaimed_submission_ages`.
+    #: Empty degrades to the depth-only reading, i.e. the behaviour before it existed.
+    unclaimed_ages: tuple[timedelta, ...] = ()
     #: Consecutive instances that came up but never registered with celery.
     consecutive_failures: int = 0
     #: Instance id -> the submission Girder still has RUNNING on it. Diagnostics only;
@@ -262,7 +286,27 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     available = [
         i for i in live if i.id not in state.spent and i.id not in failed_to_provision
     ]
-    shortfall = state.queue_depth - len(available)
+    # Demand is the *larger* of the two readings, never their sum: a submission
+    # waiting in the queue is also RUNNING-and-unclaimed in Girder, so adding them
+    # would double-count every ordinary submit and provision twice over. Taking the
+    # max means depth still drives the normal case, while a submission depth has lost
+    # sight of -- reserved by a worker that cannot start it -- still gets an instance.
+    stalled = tuple(a for a in state.unclaimed_ages if a > limits.unclaimed_grace)
+    demand = max(state.queue_depth, len(stalled))
+    if len(stalled) > state.queue_depth:
+        # The dispatch queue is not showing work that Girder says is unserved. Always
+        # an anomaly: either a worker is holding a message it will not run, or a
+        # submission was published to a queue nobody consumes. Appended to BOTH lists
+        # because `alerts` is documented as a severity view *over* `reasons`, not a
+        # second bucket -- an alert missing from the audit trail would be a bug.
+        line = (
+            f"{len(stalled)} submission(s) unclaimed for over {limits.unclaimed_grace} "
+            f"but depth={state.queue_depth}: the dispatch queue has lost sight of "
+            "work Girder still considers unserved; scaling on the unclaimed count"
+        )
+        reasons.append(line)
+        alerts.append(line)
+    shortfall = demand - len(available)
     headroom = limits.max_instances - len(live)
     create = max(0, min(shortfall, headroom))
     spent_live = len([i for i in live if i.id in state.spent])
@@ -281,8 +325,8 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         create = 0
     elif shortfall <= 0:
         reasons.append(
-            f"no new instances: depth={state.queue_depth}, {len(available)} "
-            f"available of {len(live)} live ({spent_live} spent{dead}, "
+            f"no new instances: depth={state.queue_depth}{_unclaimed_note(stalled)}, "
+            f"{len(available)} available of {len(live)} live ({spent_live} spent{dead}, "
             f"serving={state.serving})"
         )
     elif create < shortfall:
@@ -295,9 +339,9 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         )
     else:
         reasons.append(
-            f"create {create}: depth={state.queue_depth}, only {len(available)} "
-            f"available of {len(live)} live ({spent_live} spent{dead}, "
-            f"serving={state.serving})"
+            f"create {create}: depth={state.queue_depth}{_unclaimed_note(stalled)}, "
+            f"only {len(available)} available of {len(live)} live "
+            f"({spent_live} spent{dead}, serving={state.serving})"
         )
 
     return Decision(
@@ -308,6 +352,16 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         abnormal=frozenset(abnormal),
         reap_reasons=reap_reasons,
     )
+
+
+
+def _unclaimed_note(stalled) -> str:
+    """``, unclaimed=2`` when submissions are stalled, nothing when none are.
+
+    Omitted on a healthy fleet for the same reason as the ``unprovisioned`` note: a
+    field that is always zero trains the reader to skip the line it appears on.
+    """
+    return f", unclaimed={len(stalled)}" if stalled else ""
 
 
 def _since(heartbeat, now) -> str:

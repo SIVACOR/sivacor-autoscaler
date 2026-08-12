@@ -6,6 +6,7 @@ Kept separate from :mod:`plan` so the arithmetic stays testable without a broker
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from .plan import RunningJob
 
@@ -202,3 +203,96 @@ def running_jobs_by_instance(db, queue_prefix: str = "sivacor") -> dict[str, Run
         )
     logger.debug("running submissions by instance: %s", sorted(out))
     return out
+
+
+def unclaimed_submission_ages(db) -> tuple[timedelta, ...]:
+    """How long each RUNNING submission has gone without any worker claiming it.
+
+    The complement of :func:`spent_instance_ids`: submissions Girder has RUNNING that
+    carry no ``meta.worker_queue`` at all. Every one of them is a submission nobody is
+    working on, and each needs a worker -- which is demand that
+    :func:`queue_depth` **cannot** see.
+
+    Why depth is not enough. Depth counts messages *sitting in the Redis list*. A
+    message a worker has already reserved is gone from that list but not yet executing,
+    so it is invisible to depth while being just as unserved. Production 2026-08-12: a
+    worker restarted mid-chain by the wedge supervisor re-subscribed to the dispatch
+    queue (``cancel_consumer`` does not survive a restart), reserved the next
+    submission's head task it could not start for hours, and the controller read
+    ``depth=0, 0 available of 1 live`` for 17 minutes and created nothing. Same stall
+    class as run 3 / run 5, reached through yet another path -- and, like both of those,
+    a bad *input* to correct arithmetic rather than bad arithmetic.
+
+    **Returns ages, not timestamps, on purpose.** Girder stores ``created`` as naive
+    UTC while the controller's ``now`` follows OpenStack and is tz-aware -- except when
+    the fleet is empty, which is exactly the scale-from-zero case that matters most.
+    Subtracting those two raises, and coercing either one means guessing a zone the
+    value does not carry (the autoscaler's own container logs in America/Chicago, so
+    the guess would be five hours wrong). Doing the subtraction here, where Girder's
+    convention is known, removes the guess entirely and leaves :func:`plan.decide`
+    comparing timedeltas.
+
+    **Swallows its own errors and returns ``()``**, unlike :func:`serving_count`, which
+    raises. The first instinct was to raise here too -- an empty reading is, after all,
+    exactly the stall this exists to correct -- but that is the wrong trade and the test
+    suite says so: ``gather()`` is all-or-nothing, so a raise skips the whole round, and
+    *a round that does not happen is a round that does not reap*. Blocking reaps on a
+    Mongo blip would trade a leaked instance and a destroyed console buffer for a
+    slightly faster scale-up.
+
+    The asymmetry that makes this safe: returning ``()`` degrades to the depth-only
+    reading -- the behaviour before this signal existed -- and can only ever
+    *under*-provision. ``serving_count`` returning 0 would invent headroom and could
+    provoke a burst of instances, which is why that one refuses to guess. Failing loudly
+    in the log is what covers a persistent outage.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        # ``{"meta.worker_queue": None}`` deliberately relies on Mongo's equality-to-null
+        # matching a *missing* field as well as an explicit one. "Unclaimed" means no
+        # queue recorded, and all three shapes mean that. Measured on mongo:4.4::
+        #
+        #     {"meta.worker_queue": None}            -> no meta, meta {}, explicit null
+        #     {"meta.worker_queue": {"$exists": 0}}  -> no meta, meta {}
+        #     {"$eq": None, "$exists": True}         -> explicit null
+        #
+        # So ``$exists: False`` -- the obvious way to be explicit -- is strictly
+        # *narrower*: it drops a submission whose field was nulled rather than never
+        # written, which would put it back in the invisible-demand class this signal
+        # exists to end. In practice claim() only ever ``$set``s a string, so today the
+        # field is simply absent; the wider match costs nothing and survives a future
+        # code path that clears it.
+        jobs = list(
+            db[JOB_COLLECTION]
+            .find(
+                {
+                    "type": SUBMISSION_TYPE,
+                    "status": JOB_RUNNING,
+                    "meta.worker_queue": None,
+                },
+                {"created": 1},
+            )
+            .sort("created", -1)
+            .limit(CLAIM_SCAN_LIMIT)
+        )
+    except Exception:
+        logger.warning(
+            "Could not read unclaimed submissions; scaling on queue depth alone this "
+            "round, which cannot see a submission whose message a worker has reserved",
+            exc_info=True,
+        )
+        return ()
+
+    ages: list[timedelta] = []
+    for job in jobs:
+        created = job.get("created")
+        if created is None:
+            # Nothing to age it against; counting it would make an undateable
+            # document look infinitely old and provision on every tick forever.
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        ages.append(now - created)
+    if ages:
+        logger.debug("unclaimed submission ages: %s", sorted(ages))
+    return tuple(ages)
