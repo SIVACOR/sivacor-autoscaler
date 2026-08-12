@@ -91,10 +91,12 @@ why a worker needs no OpenStack credentials.
 **That supervisor has three outcomes, not two**, and the third is what makes a reap
 ambiguous. A probe that cannot see the docker socket is `blocked` — stay up, keep the
 idle clock — because a supervisor that cannot see containers must not reclaim. But
-celery failing to answer is `unreachable`, and 8 consecutive unreachable ticks (~17 min)
-**power the box off**: a worker that cannot be reached over the broker also cannot be
-*given* work. It was fail-safe-to-busy until 2026-08-01, when a half-open Redis socket
-left a VM answering nothing and living to `SIVACOR_MAX_LIFETIME_HOURS`.
+celery failing to answer is `unreachable`, which escalates: at 3 consecutive ticks
+(~6 min) the supervisor dumps process state and **restarts the worker container**, and
+at 8 (~17 min) it **powers the box off**. It was fail-safe-to-busy until 2026-08-01,
+when a half-open Redis socket left a VM answering nothing and living to
+`SIVACOR_MAX_LIFETIME_HOURS`; the restart step was added 2026-08-11, after a wedge that
+a manual restart recovered completely.
 
 The cost of that change is the case this repo now has to report honestly: **an
 `unreachable` poweroff is indistinguishable, from OpenStack, from a clean finish.** Both
