@@ -8,6 +8,7 @@ cloud-init template.
 from __future__ import annotations
 
 import base64
+import gzip
 import logging
 import re
 import shlex
@@ -156,10 +157,25 @@ def create_instance(conn, cfg, user_data: str) -> str:
     Raises :class:`QuotaExceeded` when the allocation is full so the caller can treat
     it as backpressure rather than failure.
     """
-    encoded = base64.b64encode(user_data.encode()).decode()
+    # GZIPPED, always. cloud-init sniffs the gzip magic and decompresses before
+    # reading the script, so this is transparent to the template -- and it turns a
+    # hard cliff into headroom: the 2026-08-12 template was 65,124 bytes base64
+    # uncompressed (98 % of the limit, and 65 over once the injected block was added,
+    # which stopped the fleet creating anything) against 25,324 compressed.
+    #
+    # Always, not "only when it would not fit". A path that runs solely in an
+    # emergency is a path that has never been exercised when the emergency arrives;
+    # the same argument retired the image-extraction fallback for py-spy.
+    #
+    # mtime=0 so identical input gives identical output -- user_data is stored in
+    # Nova's DB and a gratuitously changing blob makes two instances look different
+    # when they are not.
+    encoded = base64.b64encode(gzip.compress(user_data.encode(), mtime=0)).decode()
     if len(encoded) > USER_DATA_LIMIT:
         raise RuntimeError(
-            f"user_data is {len(encoded)} bytes encoded, over Nova's {USER_DATA_LIMIT}"
+            f"user_data is {len(encoded)} bytes gzipped+encoded, over Nova's "
+            f"{USER_DATA_LIMIT}. It is already compressed, so the template "
+            f"itself has to shrink -- see its SIZE BUDGET header."
         )
 
     name = f"sivacor-worker-{uuid.uuid4().hex[:8]}"

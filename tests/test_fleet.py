@@ -5,6 +5,9 @@ failure trips the circuit breaker and stops the fleet scaling exactly when it is
 busiest, and the only symptom is submissions queueing behind an idle controller.
 """
 
+import base64
+import gzip
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -170,3 +173,59 @@ def test_timestamp_parsing_tolerates_z_suffix():
 def test_unparseable_timestamp_is_none_not_an_exception():
     """An undated instance must not be mistaken for an ancient one and reaped."""
     assert fleet._parse_time("not a date") is None
+
+
+# --- user_data is gzipped (2026-08-12) --------------------------------------
+# The template hit 98 % of Nova's 65535-byte base64 limit and a comment-heavy commit
+# pushed it 65 bytes over, at which point create_instance raised on every attempt and
+# the fleet could not make a worker at all. Compression turns the cliff into headroom.
+
+
+def _cfg():
+    return SimpleNamespace(
+        deployment="test.sivacor.org",
+        image="img",
+        flavor="m3.medium",
+        network="net",
+        key_name=None,
+        security_groups=[],
+    )
+
+
+def _sent_user_data(conn):
+    (kwargs,) = conn.created
+    return kwargs["user_data"]
+
+
+def test_user_data_is_gzipped_and_round_trips():
+    conn, cfg = _Conn(), _cfg()
+    script = "#!/bin/bash\n" + "# padding that compresses well\n" * 200
+    fleet.create_instance(conn, cfg, script)
+    blob = base64.b64decode(_sent_user_data(conn))
+    assert blob[:2] == b"\x1f\x8b", "cloud-init detects gzip by magic; this must be gzip"
+    assert gzip.decompress(blob).decode() == script
+
+
+def test_gzip_is_deterministic():
+    """user_data lives in Nova's DB; identical input must not look like a change."""
+    a, b = _Conn(), _Conn()
+    fleet.create_instance(a, _cfg(), "#!/bin/bash\necho hi\n")
+    fleet.create_instance(b, _cfg(), "#!/bin/bash\necho hi\n")
+    assert _sent_user_data(a) == _sent_user_data(b)
+
+
+def test_a_template_that_would_not_fit_uncompressed_now_does():
+    """The 2026-08-12 outage, as an assertion."""
+    conn, cfg = _Conn(), _cfg()
+    script = "#!/bin/bash\n" + "# a long explanatory comment line, as this file has\n" * 1400
+    assert len(base64.b64encode(script.encode())) > fleet.USER_DATA_LIMIT
+    fleet.create_instance(conn, cfg, script)  # must not raise
+    assert len(_sent_user_data(conn)) < fleet.USER_DATA_LIMIT
+
+
+def test_the_limit_still_applies_to_the_compressed_size():
+    conn, cfg = _Conn(), _cfg()
+    # Incompressible: os.urandom defeats gzip, so this exceeds the limit even packed.
+    script = base64.b64encode(os.urandom(80_000)).decode()
+    with pytest.raises(RuntimeError, match="gzipped"):
+        fleet.create_instance(conn, cfg, script)

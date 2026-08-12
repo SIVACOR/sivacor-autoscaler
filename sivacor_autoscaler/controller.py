@@ -42,6 +42,9 @@ class Config:
     #: worker that powered off mid-run was deleted with no record of why. Point it at
     #: a bind mount: a path inside the container dies with the container.
     diagnostics_dir: Path | None = None
+    #: How long the breaker stays open before ONE creation attempt is allowed again.
+    #: Non-negotiable that this exists at all: see Controller._expire_breaker.
+    breaker_cooldown: float = 900.0
     limits: Limits = field(default_factory=Limits)
 
 
@@ -53,10 +56,15 @@ class Controller:
         #: why this is the database rather than the REST API.
         self.db = db
         self.cfg = cfg
-        #: Consecutive instances that booted but never registered with celery. Reset
-        #: by any successful round, so a transient failure does not accumulate towards
-        #: the breaker.
+        #: Consecutive failed creation attempts. Cleared by a successful create, and
+        #: by the cooldown in :meth:`_expire_breaker` -- which is what makes the
+        #: breaker recoverable at all. The comment here used to claim it was "reset by
+        #: any successful round"; it was not reset anywhere, and that cost a production
+        #: outage on 2026-08-12.
         self.consecutive_failures = 0
+        #: ``time.monotonic()`` of the last failure, or None. Monotonic on purpose: a
+        #: clock step must not extend or collapse the cooldown.
+        self._last_failure: float | None = None
         #: Instances observed to have claimed a submission, remembered for as long as
         #: OpenStack still reports them. See :meth:`_spent`.
         self._spent_seen: set[str] = set()
@@ -128,8 +136,40 @@ class Controller:
             consecutive_failures=self.consecutive_failures,
         )
 
+    def _expire_breaker(self) -> None:
+        """Reopen the breaker after a quiet period, because nothing else can.
+
+        ``plan.decide`` forces ``create = 0`` while the counter sits at the threshold,
+        so a tripped breaker prevents the very success that would clear it: resetting
+        on success is necessary and **not sufficient**. Without a time-based reopen it
+        latches until the process is restarted by hand.
+
+        Measured 2026-08-12: an oversized ``user_data`` (65 bytes over Nova's limit)
+        tripped it in about 90 s, and it then refused every create for five minutes --
+        through the fix being deployed -- logging only the ordinary "BREAKER OPEN"
+        line. The fleet was down until someone restarted the service.
+
+        One attempt, not a reset to trusting: if that attempt fails the counter is back
+        at the threshold immediately and the fleet waits another cooldown. That keeps
+        the property the breaker exists for -- a genuinely broken image cannot loop
+        burning SUs -- while making an outage self-limiting rather than permanent.
+        """
+        if not self.consecutive_failures or self._last_failure is None:
+            return
+        if time.monotonic() - self._last_failure < self.cfg.breaker_cooldown:
+            return
+        logger.warning(
+            "breaker: %.0fs since the last creation failure, allowing one attempt "
+            "again (was %d consecutive)",
+            self.cfg.breaker_cooldown,
+            self.consecutive_failures,
+        )
+        self.consecutive_failures = 0
+        self._last_failure = None
+
     def step(self) -> None:
         """One iteration. Never raises for an expected condition."""
+        self._expire_breaker()
         try:
             state = self.gather()
         except Exception:
@@ -178,6 +218,11 @@ class Controller:
                     worker_image=self.cfg.worker_image,
                 )
                 fleet.create_instance(self.conn, self.cfg, user_data)
+                # A create that works is the only positive evidence that whatever
+                # tripped the breaker is over. Nothing else cleared this counter
+                # before 2026-08-12.
+                self.consecutive_failures = 0
+                self._last_failure = None
             except fleet.QuotaExceeded as exc:
                 # Backpressure, not failure: the submission stays queued and this must
                 # not count towards the breaker, or a full allocation would stop the
@@ -186,6 +231,7 @@ class Controller:
                 break
             except Exception:
                 self.consecutive_failures += 1
+                self._last_failure = time.monotonic()
                 logger.warning(
                     "instance creation failed (%d consecutive)",
                     self.consecutive_failures,
