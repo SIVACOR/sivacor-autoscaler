@@ -29,6 +29,17 @@ jobs:
       - name: Test
         run: pytest -q
 
+  # DEPRECATED as of 2026-08-13 (worker_sizing_plan.md P0.5). Nothing deploys this
+  # image any more: the controller now runs from the girder-sivacor image, which
+  # pip-installs this package at a pinned sha, because assignment needs Girder's
+  # model layer in-process (S3). `deploy-sivacor` no longer references
+  # SIVACOR_AUTOSCALER_IMAGE.
+  #
+  # Kept, not deleted, until the consolidated controller has completed a full tick
+  # on the test mirror -- the same rule the plan applies to every other fallback:
+  # do not remove the way back in the change that stops using it. Delete this job
+  # once that is confirmed. The `test` job above stays either way; it is what gates
+  # the sha that girder-sivacor's Dockerfile pins.
   docker:
     needs: test
     # Forks cannot read the registry secrets, and a PR build would push nothing
