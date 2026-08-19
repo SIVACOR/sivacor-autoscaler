@@ -161,6 +161,11 @@ def _fake_girder(monkeypatch, *, api_url="https://girder.example/api/v1", fail=F
             if sent is not None:
                 sent.append(("head.set", kw))
 
+        def freeze(self):
+            # celery assigns an id only if the signature has none, so the id a
+            # frozen signature reports is the id the message will carry.
+            return types.SimpleNamespace(id="celery-task-id-1")
+
     class Chain:
         def __init__(self):
             self.tasks = [Head()]
@@ -179,7 +184,9 @@ def _fake_girder(monkeypatch, *, api_url="https://girder.example/api/v1", fail=F
     class Job:
         def createJob(self, **kw):
             if sent is not None:
-                sent.append(("child job", kw["type"], kw["title"], kw["args"]))
+                sent.append(
+                    ("child job", kw["type"], kw["title"], kw["args"], kw.get("otherFields"))
+                )
             return {"_id": "child-1"}
 
     class Users:
@@ -330,6 +337,12 @@ def test_the_head_step_gets_a_child_job_this_process_creates(monkeypatch):
     child = next(e for e in sent if isinstance(e, tuple) and e[0] == "child job")
     assert child[1] == "celery", "get_submission_child_jobs selects on type"
     assert child[3][3] == "j1", "args.3 is the join back to the submission"
+    # Not optional, and omitting it is worse than creating no child job at all:
+    # girder_plugin_worker's attachParentJob does
+    #     event.info['parentId'] = Job().findOne({'celeryTaskId': ...})['_id']
+    # with no null check, so every LATER step's POST /job 500s and the submission
+    # ends up with one child job instead of thirteen. Mirror, 2026-08-19.
+    assert child[4] == {"celeryTaskId": "celery-task-id-1"}
 
     spec = next(e for e in sent if isinstance(e, tuple) and e[0] == "head.set")
     # In *headers*, not bare options: jobInfoSpec is neither a reserved header nor a

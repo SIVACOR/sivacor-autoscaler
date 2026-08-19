@@ -152,8 +152,22 @@ def _record_head_job(chain, submission) -> None:
     So it is created here, through the model layer this process genuinely has, and
     ``jobInfoSpec`` is attached to the head signature -- which also makes
     ``girder_before_task_publish`` skip its own attempt entirely rather than warn.
-    ``celeryTaskId`` is deliberately not set: the id does not exist until publish, and
-    nothing in SIVACOR reads that field.
+    **``celeryTaskId`` is not optional, and leaving it out is worse than creating no
+    child job at all.** The first version of this omitted it, reasoning that the id does
+    not exist until publish and that nothing in SIVACOR reads the field. Nothing in
+    SIVACOR does — but ``girder_plugin_worker``'s ``attachParentJob`` does, on the
+    server, for *every* child job the worker posts afterwards::
+
+        parentJob = Job().findOne({'celeryTaskId': celeryParentTaskId})
+        event.info['parentId'] = parentJob['_id']      # no null check
+
+    So a head child job without it makes `POST /job` raise, and the worker's
+    ``girder_before_task_publish`` logs `Failed to post job: HTTP error 500` and carries
+    on. Measured on the mirror 2026-08-19: **one** child job for the whole submission
+    instead of thirteen — strictly worse than the missing-head problem this function
+    exists to fix. Freezing the head before creating the child is what makes the id
+    knowable in advance; ``freeze()`` assigns one only if the signature has none, so the
+    id survives into ``apply_async``.
     """
     from girder.models.user import User
     from girder_jobs.models.job import Job
@@ -167,6 +181,7 @@ def _record_head_job(chain, submission) -> None:
         user=User().load(submission["userId"], force=True),
         args=head.args,
         kwargs=head.kwargs,
+        otherFields={"celeryTaskId": head.freeze().id},
     )
     # Into ``headers``, not the signature's options. ``jobInfoSpec`` is neither a
     # reserved header nor a reserved option, so ``Task.apply_async`` would leave a
