@@ -120,12 +120,21 @@ class Controller:
         """
         armed = signals.targeted_assignment(self.db)
         if armed != self._armed:
+            # The first reading is a statement of state, not a transition. "now OFF ...
+            # no longer" at startup reads as though someone had just disarmed it, which
+            # is precisely wrong for the line an operator greps to confirm what a
+            # freshly deployed controller is doing -- the first use this line ever had
+            # (mirror, 2026-08-19).
             logger.warning(
-                "targeted assignment is now %s (%s): submissions are placed by this "
-                "controller%s",
+                "targeted assignment %s %s (%s): %s",
+                "is" if self._armed is None else "is now",
                 "ON" if armed else "OFF",
                 signals.TARGETED_ASSIGNMENT_KEY,
-                "" if armed else " no longer; Girder dispatches them itself",
+                (
+                    "this controller places submissions"
+                    if armed
+                    else "Girder dispatches them to the shared queue"
+                ),
             )
             self._armed = armed
         return replace(self.cfg.limits, assign=armed)

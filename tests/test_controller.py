@@ -407,3 +407,30 @@ def test_a_round_is_skipped_rather_than_guessing_the_arm_flag(monkeypatch):
     )
 
     ctl.step()  # no exception, no decision
+
+
+def test_the_arm_flag_line_says_state_at_startup_and_change_on_a_flip(monkeypatch, caplog):
+    """This line is what an operator greps to confirm a fresh deployment.
+
+    The first reading is a statement of state, not a transition: "now OFF ... no
+    longer" on startup reads as though somebody had just disarmed it. Observed on the
+    mirror the first time the line was ever used, 2026-08-19.
+    """
+    ctl = Controller(
+        EmptyCloud(), FakeRedis(), ArmedGirder([], armed=False), controller([]).cfg
+    )
+
+    with caplog.at_level("WARNING"):
+        ctl.limits()
+        assert "targeted assignment is OFF" in caplog.text
+        assert "is now" not in caplog.text
+
+        caplog.clear()
+        ctl.db.armed = True
+        ctl.limits()
+        assert "targeted assignment is now ON" in caplog.text
+
+        # Steady state is silent: this fires on change, not every 30 s.
+        caplog.clear()
+        ctl.limits()
+        assert caplog.text == ""
