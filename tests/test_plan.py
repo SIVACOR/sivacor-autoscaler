@@ -55,10 +55,17 @@ def state(
     )
 
 
-def waiting(*ages, ids=None):
-    """Waiting submissions, named ``sub-0``, ``sub-1``, ... unless ``ids`` says otherwise."""
+def waiting(*ages, ids=None, assignable=True):
+    """Waiting submissions, named ``sub-0``, ``sub-1``, ... unless ``ids`` says otherwise.
+
+    ``assignable=False`` is the mixed-mode submission: dispatched to the shared queue
+    by ``submit_job`` before assignment was armed, so it is demand but not ours.
+    """
     names = ids or [f"sub-{i}" for i in range(len(ages))]
-    return tuple(WaitingSubmission(id=n, age=a) for n, a in zip(names, ages))
+    return tuple(
+        WaitingSubmission(id=n, age=a, assignable=assignable)
+        for n, a in zip(names, ages)
+    )
 
 
 #: Limits with the D9 check armed. The production default is None (off), so every
@@ -729,3 +736,75 @@ def test_the_cap_makes_submissions_wait_rather_than_overbooking():
     assert tick is None, "three submissions cannot be placed until a worker finishes"
     assert creates == 5
     assert len(placed) == 5
+
+
+# --- mixed mode: demand and assignability part company (rollout step 3) ------
+
+
+def test_a_submission_girder_already_dispatched_is_never_placed():
+    """Two workers on one workspace, arriving through the operator's door.
+
+    Rollout step 3 runs both paths at once. A submission ``submit_job`` published to
+    the shared queue is RUNNING and unclaimed, so it looks exactly like one waiting to
+    be placed -- and publishing a second chain for it is the failure targeted
+    assignment exists to remove.
+    """
+    d = decide(
+        state(
+            waiting=waiting(OLDEST, assignable=False),
+            instances=[inst("w1")],
+            ready=["w1"],
+        ),
+        ASSIGN,
+    )
+
+    assert d.assign == ()
+
+
+def test_a_submission_girder_dispatched_still_counts_as_demand():
+    """It needs an instance either way; only *who publishes* differs.
+
+    Dropping it from demand would stop the fleet scaling for exactly the submissions
+    that are mid-rollout, which is the stall class this signal was added to end.
+    """
+    d = decide(state(waiting=waiting(OLDEST, assignable=False)), ASSIGN)
+
+    assert d.create == 1
+
+
+def test_the_placeable_head_of_the_line_is_served_past_an_unplaceable_one():
+    """S7 is oldest-first among the submissions that are ours, not among all of them.
+
+    An older submission on the other dispatch path is not a head-of-line block: a
+    worker is already coming for it, so waiting behind it would be waiting for nothing.
+    """
+    d = decide(
+        state(
+            waiting=(
+                WaitingSubmission(id="legacy", age=OLDEST, assignable=False),
+                WaitingSubmission(id="ours", age=RECENT),
+            ),
+            instances=[inst("w1")],
+            ready=["w1"],
+        ),
+        ASSIGN,
+    )
+
+    assert d.assign == (("ours", "id-w1"),)
+
+
+def test_nothing_of_ours_to_place_does_not_read_as_a_stall():
+    """The arming failure and the mixed-mode reading must not share a log line.
+
+    "waiting, none assignable" is the line that says no worker announces readiness --
+    the deadlock. A submission on the other path is not that, and a reader who cannot
+    tell them apart will chase the wrong one.
+    """
+    d = decide(
+        state(waiting=waiting(OLDEST, assignable=False), instances=[inst("w1")],
+              ready=["w1"]),
+        ASSIGN,
+    )
+
+    assert any("none of them ours to place" in r for r in d.reasons)
+    assert not any("none assignable" in r for r in d.reasons)

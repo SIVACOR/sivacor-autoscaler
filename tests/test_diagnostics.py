@@ -188,6 +188,11 @@ class FakeGirder:
     def count_documents(self, query):
         return 0
 
+    def find_one(self, query):
+        # The arm flag, read every tick from Girder's setting document. Absent means
+        # off, which is what every test here assumes unless it says otherwise.
+        return None
+
 
 class RecordingConn(FakeConn):
     """Records the order of console reads and deletes -- the contract that matters."""

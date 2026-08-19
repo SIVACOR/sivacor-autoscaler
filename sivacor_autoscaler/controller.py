@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import diagnostics, fleet, signals
+from . import diagnostics, dispatch, fleet, signals
 from .plan import FleetState, Limits, decide
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,11 @@ class Controller:
         #: Instances observed to have claimed a submission, remembered for as long as
         #: OpenStack still reports them. See :meth:`_spent`.
         self._spent_seen: set[str] = set()
+        #: Last observed value of Girder's arm flag, so a change can be logged once
+        #: rather than every tick. Arming is the highest-stakes event this process
+        #: takes part in and it happens with no restart and no deploy, so it must
+        #: leave a line in the log to correlate an incident against.
+        self._armed: bool | None = None
 
     def _spent(self, instances) -> frozenset[str]:
         """Instance ids that have claimed a submission, monotonically.
@@ -104,7 +109,29 @@ class Controller:
         self._spent_seen &= known
         return frozenset(self._spent_seen)
 
-    def gather(self) -> FleetState:
+    def limits(self) -> Limits:
+        """This tick's limits, with ``assign`` taken from Girder's setting.
+
+        The arm flag is not configuration of this process: it is one value both
+        ``submit_job`` and this controller read, so that no state exists in which one
+        is flipped and the other is not. See :func:`signals.targeted_assignment`. It
+        is read once per tick and threaded through ``gather`` and ``decide`` together,
+        so a flip mid-round cannot make those two disagree either.
+        """
+        armed = signals.targeted_assignment(self.db)
+        if armed != self._armed:
+            logger.warning(
+                "targeted assignment is now %s (%s): submissions are placed by this "
+                "controller%s",
+                "ON" if armed else "OFF",
+                signals.TARGETED_ASSIGNMENT_KEY,
+                "" if armed else " no longer; Girder dispatches them itself",
+            )
+            self._armed = armed
+        return replace(self.cfg.limits, assign=armed)
+
+    def gather(self, limits: Limits | None = None) -> FleetState:
+        limits = self.cfg.limits if limits is None else limits
         # Instances first: _spent() prunes against them, and an id OpenStack no longer
         # reports must not linger in the cache.
         instances = fleet.list_fleet(self.conn, self.cfg.deployment)
@@ -131,8 +158,7 @@ class Controller:
             # set here assigns nothing, forever, while every other number reads healthy.
             ready=(
                 signals.ready_instance_ids(self.redis)
-                if self.cfg.limits.provision_deadline is not None
-                or self.cfg.limits.assign
+                if limits.provision_deadline is not None or limits.assign
                 else frozenset()
             ),
             instances=instances,
@@ -174,14 +200,17 @@ class Controller:
         """One iteration. Never raises for an expected condition."""
         self._expire_breaker()
         try:
-            state = self.gather()
+            # The arm flag first: gather() reads a signal it would otherwise skip, and
+            # both halves of this tick have to be decided from one reading of it.
+            limits = self.limits()
+            state = self.gather(limits)
         except Exception:
             # Deciding on partial information is how a controller creates instances it
             # does not need. Skip the round; the next one is 30 s away.
             logger.warning("skipping round: could not gather state", exc_info=True)
             return
 
-        decision = decide(state, self.cfg.limits)
+        decision = decide(state, limits)
         # alerts is a subset of reasons, so filter rather than log the anomalies twice.
         alerts = set(decision.alerts)
         for reason in decision.reasons:
@@ -189,17 +218,6 @@ class Controller:
                 logger.info("%s", reason)
         for alert in decision.alerts:
             logger.warning("%s", alert)
-
-        if decision.assign:
-            # The executor -- claim, then publish to the instance's private queue -- is
-            # the second half of P2. Loud rather than silent: a decision nothing acts on
-            # is how two changes in autoscaling_plan.md shipped inert. Unreachable
-            # today, because Limits.assign cannot be turned on.
-            logger.error(
-                "assignment is armed but this build cannot execute it: %d binding(s) "
-                "decided and dropped. Turn Limits.assign off until the assigner lands.",
-                len(decision.assign),
-            )
 
         by_id = {i.id: i for i in state.instances}
 
@@ -220,6 +238,25 @@ class Controller:
                 fleet.delete_instance(self.conn, instance_id)
             except Exception:
                 logger.warning("could not delete %s", instance_id, exc_info=True)
+
+        # Assignments before creates: placing work on an instance that already exists is
+        # the cheap half, and a create that fails must not stop it. Each binding is
+        # independent -- one submission whose chain will not build must not strand the
+        # rest of the round -- and none of them touch the breaker, which counts *instance
+        # creation* failures and would stop the whole fleet if a bad submission could
+        # feed it.
+        for submission_id, instance_id in decision.assign:
+            try:
+                dispatch.assign(
+                    self.db, submission_id, instance_id, self.cfg.dispatch_queue
+                )
+            except Exception:
+                logger.warning(
+                    "could not assign submission %s to %s",
+                    submission_id,
+                    instance_id,
+                    exc_info=True,
+                )
 
         for _ in range(decision.create):
             try:

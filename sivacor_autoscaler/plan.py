@@ -73,6 +73,21 @@ class WaitingSubmission:
     #: deliberately unused by :func:`decide`.
     memory_gb: int | None = None
 
+    #: Whether this submission is *ours* to place, per ``meta.awaiting_assignment``.
+    #:
+    #: **Demand and assignability part company here, and only here.** Girder records
+    #: which route each submission took at submit time, so flipping the arm flag while
+    #: one is in flight cannot make the controller assign something ``submit_job``
+    #: already published to the shared queue -- two workers on one workspace. During
+    #: rollout step 3 both kinds are live at once: a dispatched-but-unclaimed
+    #: submission is still real demand and still needs an instance created for it, it
+    #: simply must not be *placed* by us.
+    #:
+    #: Defaults to ``True`` so the arithmetic tests stay about arithmetic;
+    #: :func:`signals.waiting_submissions` maps a missing field to ``False``, which is
+    #: the safe direction for a job document written before this existed.
+    assignable: bool = True
+
 
 @dataclass(frozen=True)
 class Limits:
@@ -414,13 +429,17 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         # Youngest first: an unassigned instance has been idle its whole life, so the
         # youngest is furthest from its own poweroff. See assign_max_age.
         assignable.sort(key=_youngest_first(now))
+        # Ours to place, per WaitingSubmission.assignable: during rollout step 3 a
+        # submission Girder already dispatched is still demand, but publishing a second
+        # chain for it would put two workers on one workspace.
+        placeable = tuple(w for w in _oldest_first(state.waiting) if w.assignable)
         # Oldest submission first (S7). One size means everything fits everywhere, so a
         # plain zip; P3 adds the size filter and the head-of-line stop.
-        for sub, inst in zip(_oldest_first(state.waiting), assignable):
+        for sub, inst in zip(placeable, assignable):
             assign.append((sub.id, inst.id))
             reasons.append(
                 f"assign submission {sub.id} -> {inst.name}: waiting {sub.age}, "
-                f"oldest of {len(state.waiting)}"
+                f"oldest of {len(placeable)} placeable ({len(state.waiting)} waiting)"
             )
         if aged_out and state.waiting:
             # Only worth saying in this combination. Ageing out with nothing waiting is
@@ -437,15 +456,23 @@ def decide(state: FleetState, limits: Limits) -> Decision:
             )
             reasons.append(line)
             alerts.append(line)
-        elif state.waiting and not assignable:
+        elif placeable and not assignable:
             # Routine on an empty fleet -- the tick before the instances exist -- but
             # it is the only line that distinguishes that from the arming failure where
             # nothing is ever assignable because no worker announces readiness.
             reasons.append(
-                f"{len(state.waiting)} submission(s) waiting, none assignable: "
+                f"{len(placeable)} submission(s) waiting, none assignable: "
                 f"{len(live)} live, {len([i for i in live if i.id in state.spent])} "
                 f"already assigned, {len([i for i in live if i.id in state.ready])} "
                 f"registered with the broker"
+            )
+        elif state.waiting and not placeable:
+            # The mixed-mode reading, and it must not look like the line above: these
+            # submissions are not stuck, they are on the other path and a worker is
+            # already coming for them. Only reachable during rollout step 3.
+            reasons.append(
+                f"{len(state.waiting)} submission(s) waiting, none of them ours to "
+                "place: dispatched to the shared queue before assignment was armed"
             )
 
     # --- creates -----------------------------------------------------------

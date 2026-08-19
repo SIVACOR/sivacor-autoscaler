@@ -18,9 +18,11 @@ import pytest
 from sivacor_autoscaler.signals import (
     READY_KEY_PREFIX,
     SUBMISSION_TYPE,
+    TARGETED_ASSIGNMENT_KEY,
     ready_instance_ids,
     serving_count,
     spent_instance_ids,
+    targeted_assignment,
     waiting_submissions,
 )
 
@@ -309,3 +311,82 @@ def test_unclaimed_degrades_to_depth_only_rather_than_skipping_the_round():
     fails if this ever starts raising again.
     """
     assert waiting_submissions(FakeGirder([], raises=True)) == ()
+
+
+# --- the arm flag, read from Girder's own setting --------------------------
+
+
+class FakeSettings:
+    """``db["setting"]`` with one document lookup, recording the query."""
+
+    def __init__(self, doc=None, raises=False):
+        self.doc, self.raises, self.queries = doc, raises, []
+
+    def __getitem__(self, name):
+        assert name == "setting", "the flag lives in Girder's settings collection"
+        return self
+
+    def find_one(self, query):
+        if self.raises:
+            raise RuntimeError("mongo down")
+        self.queries.append(query)
+        return self.doc
+
+
+def test_the_arm_flag_is_read_from_girders_setting():
+    """One value, two processes. ``submit_job`` reads this same document."""
+    db = FakeSettings({"key": TARGETED_ASSIGNMENT_KEY, "value": True})
+
+    assert targeted_assignment(db) is True
+    assert db.queries == [{"key": TARGETED_ASSIGNMENT_KEY}]
+
+
+def test_an_unwritten_setting_means_off():
+    """Girder's default is off, and the two defaults have to agree.
+
+    A deployment that has never set it must not start assigning, because
+    ``submit_job`` on the same deployment is still publishing to the shared queue.
+    """
+    assert targeted_assignment(FakeSettings(None)) is False
+    assert targeted_assignment(FakeSettings({"key": TARGETED_ASSIGNMENT_KEY})) is False
+
+
+def test_the_arm_flag_refuses_to_guess_when_mongo_is_down():
+    """Both defaults are wrong in the deployment where it matters.
+
+    ``False`` while Girder is armed stalls every submission; ``True`` while it is not
+    publishes a second chain for one already dispatched. The caller skips the round on
+    a Mongo failure, which is the only safe answer.
+    """
+    with pytest.raises(RuntimeError):
+        targeted_assignment(FakeSettings(raises=True))
+
+
+def test_a_submission_dispatched_the_old_way_is_demand_but_not_ours_to_place():
+    """The mixed-mode case, and getting it wrong is two workers on one workspace.
+
+    Rollout step 3 runs both paths at once. A submission ``submit_job`` published to
+    the shared queue is RUNNING and unclaimed, so it is real demand and still needs an
+    instance -- but publishing a second chain for it is the failure S2 exists to
+    remove, arriving through the operator's door rather than the queue's.
+    """
+    old = _job(5)
+    new = _job(3)
+    new["meta"] = {"awaiting_assignment": True}
+
+    placed = {s.id: s.assignable for s in waiting_submissions(FakeGirder([old, new]))}
+
+    assert placed == {"job-5": False, "job-3": True}
+
+
+def test_the_marker_is_projected_or_every_submission_reads_as_ours():
+    """The field has to be asked for; a projection that omits it defaults to False.
+
+    Silent in exactly the wrong direction: every submission would look un-placeable
+    and the fleet would boot instances it never assigns anything to.
+    """
+    db = FakeGirder([_job(5)])
+    waiting_submissions(db)
+
+    (find,) = [c for c in db.calls if c[0] == "find"]
+    assert "meta.awaiting_assignment" in find[2]

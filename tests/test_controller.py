@@ -10,6 +10,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from sivacor_autoscaler import controller as controller_mod
 from sivacor_autoscaler.controller import Config, Controller
 from sivacor_autoscaler.plan import Decision, FleetState, Instance, Limits
@@ -45,6 +47,11 @@ class FakeGirder:
 
     def count_documents(self, query):
         return 0
+
+    def find_one(self, query):
+        # The arm flag, read every tick from Girder's setting document. Absent means
+        # off, which is what every test here assumes unless it says otherwise.
+        return None
 
 
 class FakeRedis:
@@ -157,7 +164,9 @@ def _armed(monkeypatch, ctl, conn):
     monkeypatch.setattr(controller_mod.fleet, "create_instance", create_instance)
     # decide() is not under test here; drive the create loop directly.
     monkeypatch.setattr(controller_mod, "decide", lambda state, limits: Decision(create=1))
-    monkeypatch.setattr(ctl, "gather", lambda: FleetState(queue_depth=1, serving=0, now=NOW))
+    monkeypatch.setattr(
+        ctl, "gather", lambda limits=None: FleetState(queue_depth=1, serving=0, now=NOW)
+    )
 
 
 def test_a_successful_create_clears_the_breaker(monkeypatch):
@@ -272,3 +281,129 @@ def test_readiness_is_left_unread_when_nothing_will_consult_it():
 
     assert redis.key_patterns == []
     assert state.ready == frozenset()
+
+
+# --- executing an assignment (P2) -------------------------------------------
+
+
+class ArmedGirder(FakeGirder):
+    """A database whose arm flag is on, and which records claims."""
+
+    def __init__(self, jobs, armed=True):
+        super().__init__(jobs)
+        self.armed = armed
+
+    def find_one(self, query):
+        return {"key": "sivacor.targeted_assignment", "value": self.armed}
+
+
+def _assigning(monkeypatch, ctl, decision, calls):
+    """Drive step() straight at one decision, with dispatch stubbed out."""
+    monkeypatch.setattr(controller_mod, "decide", lambda state, limits: decision)
+    monkeypatch.setattr(
+        ctl, "gather", lambda limits=None: FleetState(queue_depth=0, serving=0, now=NOW)
+    )
+    monkeypatch.setattr(
+        controller_mod.dispatch,
+        "assign",
+        lambda db, sub, inst, queue: calls.append((sub, inst, queue)) or True,
+    )
+
+
+def test_an_assignment_is_executed_against_the_instances_private_queue(monkeypatch):
+    """The one line that is the feature, reached from a decision.
+
+    Before this the executor did not exist and step() logged an ERROR instead -- a
+    decision nothing acts on, which is how two changes in autoscaling_plan.md shipped
+    inert for two loop tests.
+    """
+    ctl, calls = controller([]), []
+    _assigning(monkeypatch, ctl, Decision(assign=(("sub-1", "uuid-a"),)), calls)
+
+    ctl.step()
+
+    assert calls == [("sub-1", "uuid-a", "sivacor")]
+
+
+def test_one_bad_binding_does_not_strand_the_rest_of_the_round(monkeypatch):
+    """A submission whose chain will not build is one submission, not an outage."""
+    ctl, calls = controller([]), []
+    _assigning(
+        monkeypatch,
+        ctl,
+        Decision(assign=(("sub-1", "uuid-a"), ("sub-2", "uuid-b"))),
+        calls,
+    )
+
+    def explode(db, sub, inst, queue):
+        if sub == "sub-1":
+            raise RuntimeError("chain would not build")
+        calls.append((sub, inst, queue))
+        return True
+
+    monkeypatch.setattr(controller_mod.dispatch, "assign", explode)
+
+    ctl.step()
+
+    assert calls == [("sub-2", "uuid-b", "sivacor")]
+
+
+def test_a_bad_binding_never_touches_the_circuit_breaker(monkeypatch):
+    """The breaker counts instance creations, and it stops the WHOLE fleet at three.
+
+    Feeding it submission-shaped failures would let one researcher's bad workflow
+    take the fleet down for a cooldown -- the same shape as the 2026-08-12 latch.
+    """
+    ctl, calls = controller([]), []
+    _assigning(monkeypatch, ctl, Decision(assign=(("sub-1", "uuid-a"),)), calls)
+    monkeypatch.setattr(
+        controller_mod.dispatch,
+        "assign",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("nope")),
+    )
+
+    for _ in range(4):
+        ctl.step()
+
+    assert ctl.consecutive_failures == 0
+
+
+def test_the_arm_flag_comes_from_girder_and_reaches_decide(monkeypatch):
+    """One value, two processes: this controller must not have an opinion of its own.
+
+    Any state where Girder's flag and this one disagree is broken -- both publishing
+    is two workers on one workspace, neither is a fleet that looks healthy and idle
+    while every submission waits.
+    """
+    seen = []
+    ctl = Controller(EmptyCloud(), FakeRedis(), ArmedGirder([], armed=True), controller([]).cfg)
+    monkeypatch.setattr(
+        controller_mod,
+        "decide",
+        lambda state, limits: seen.append(limits.assign) or Decision(),
+    )
+    monkeypatch.setattr(
+        ctl, "gather", lambda limits=None: FleetState(queue_depth=0, serving=0, now=NOW)
+    )
+
+    ctl.step()
+    ctl.db.armed = False
+    ctl.step()
+
+    assert seen == [True, False], "flipping the setting takes effect without a restart"
+
+
+def test_a_round_is_skipped_rather_than_guessing_the_arm_flag(monkeypatch):
+    """Both defaults are wrong in the deployment where it matters, so neither is taken."""
+    class BrokenSettings(FakeGirder):
+        def find_one(self, query):
+            raise RuntimeError("mongo down")
+
+    ctl = Controller(EmptyCloud(), FakeRedis(), BrokenSettings([]), controller([]).cfg)
+    monkeypatch.setattr(
+        controller_mod,
+        "decide",
+        lambda state, limits: pytest.fail("decided on a guessed arm flag"),
+    )
+
+    ctl.step()  # no exception, no decision

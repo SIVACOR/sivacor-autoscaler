@@ -188,6 +188,21 @@ def main() -> int:
             cfg.limits.max_lifetime,
         )
 
+    # Fourth of the same family, and the one that fails latest if left unsaid. Once
+    # targeted assignment is armed -- which is a Girder setting, not an environment
+    # variable, so it can happen without a redeploy and without this process
+    # restarting -- the controller publishes celery chains itself. Without a broker it
+    # claims the submission and then cannot send it, so the submission is bound to a
+    # worker that is never told and waits for the server-side reaper. Warn now, while
+    # nothing is at stake, rather than at the first assignment.
+    if not os.environ.get("GIRDER_WORKER_BROKER"):
+        logging.getLogger(__name__).warning(
+            "GIRDER_WORKER_BROKER is unset: this controller can decide assignments "
+            "but cannot publish them. Set it (and GIRDER_WORKER_BACKEND) to the same "
+            "broker girder and local_worker use before arming "
+            "sivacor.targeted_assignment."
+        )
+
     import openstack
     import redis as redis_lib
     from pymongo import MongoClient

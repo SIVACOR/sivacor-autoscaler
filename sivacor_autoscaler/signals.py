@@ -56,6 +56,39 @@ JOB_COLLECTION = "job"
 #: Girder's job type for a submission, set by ``rest.py``'s ``submit_job``.
 SUBMISSION_TYPE = "sivacor_submission"
 
+#: Girder's settings collection, and the key holding the arm flag. Must match
+#: ``girder_sivacor.settings.PluginSettings.TARGETED_ASSIGNMENT``.
+SETTING_COLLECTION = "setting"
+TARGETED_ASSIGNMENT_KEY = "sivacor.targeted_assignment"
+
+
+def targeted_assignment(db) -> bool:
+    """Whether this controller should be placing submissions, per Girder's setting.
+
+    **Read every tick, from Girder's own setting document, and from nowhere else.**
+    The two halves of this switch live in different processes -- ``submit_job`` stops
+    publishing, the controller starts assigning -- and any state where one is flipped
+    and the other is not is a broken deployment: both publishing means two workers on
+    one workspace, neither means nothing runs while the fleet reads as healthy and
+    idle. Two environment variables can disagree about that; one document cannot. That
+    is also why there is no local override to turn this off: an override *is* the
+    second source.
+
+    Per-tick rather than at startup so arming and disarming take effect within one
+    interval, with no restart to forget and no window in which the two processes hold
+    different beliefs.
+
+    **Raises rather than guessing.** Either default is wrong in the deployment where
+    it matters: ``False`` while Girder is armed stalls everything, ``True`` while it is
+    not double-publishes. A read failure here is a Mongo failure, and the caller
+    already skips the round on those.
+
+    Absent document means the setting was never written, which is Girder's default of
+    off. The two defaults have to agree; ``settings.py`` seeds ``False``.
+    """
+    doc = db[SETTING_COLLECTION].find_one({"key": TARGETED_ASSIGNMENT_KEY})
+    return bool(doc and doc.get("value"))
+
 
 def queue_depth(redis_client, queue: str) -> int:
     """Submissions published to ``queue`` that no worker has taken yet.
@@ -292,7 +325,7 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
                     "status": JOB_RUNNING,
                     "meta.worker_queue": None,
                 },
-                {"created": 1},
+                {"created": 1, "meta.awaiting_assignment": 1},
             )
             # Oldest first, and the direction is load-bearing now that this is the
             # assigner's work list: newest-first plus a limit truncates away the head of
@@ -318,7 +351,16 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
             continue
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        out.append(WaitingSubmission(id=str(job.get("_id")), age=now - created))
+        out.append(
+            WaitingSubmission(
+                id=str(job.get("_id")),
+                age=now - created,
+                # Missing means the submission predates the marker, i.e. it was
+                # dispatched to the shared queue: demand, but not ours to place.
+                # Defaulting the other way would publish a second chain for it.
+                assignable=bool((job.get("meta") or {}).get("awaiting_assignment")),
+            )
+        )
     if out:
         logger.debug(
             "waiting submissions (oldest first): %s",
