@@ -78,6 +78,7 @@ def build_user_data(
     manager_ip: str,
     girder_host: str | None = None,
     worker_image: str | None = None,
+    worker_queues: str | None = None,
 ) -> str:
     """Inject configuration into the cloud-init template.
 
@@ -106,6 +107,14 @@ def build_user_data(
         lines.append(f"GIRDER_HOST={shlex.quote(girder_host)}")
     if worker_image:
         lines.append(f"WORKER_IMAGE={shlex.quote(worker_image)}")
+    if worker_queues:
+        # What celery subscribes to. Unset leaves the template's own default,
+        # `sivacor,<private queue>` -- both the shared dispatch queue and its own,
+        # which is what every worker has always done. A deployment that has armed
+        # targeted assignment sets it to just the private queue (P2 rollout step 4);
+        # one that has not must not, and since both share one template file that
+        # decision has to travel as a value rather than an edit.
+        lines.append(f"WORKER_QUEUES={shlex.quote(worker_queues)}")
     return text.replace(INJECT_MARKER, "\n".join(lines))
 
 

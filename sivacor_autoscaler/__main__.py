@@ -55,6 +55,7 @@ def build_config() -> Config:
         dispatch_queue=_env("SIVACOR_DISPATCH_QUEUE", "sivacor"),
         girder_host=_env("SIVACOR_GIRDER_HOST"),
         worker_image=_env("SIVACOR_WORKER_IMAGE"),
+        worker_queues=_env("SIVACOR_WORKER_QUEUES"),
         image=_env("SIVACOR_OS_IMAGE", "Featured-Ubuntu24"),
         flavor=_env("SIVACOR_OS_FLAVOR", "m3.medium"),
         network=_env("SIVACOR_OS_NETWORK", "auto_allocated_network"),

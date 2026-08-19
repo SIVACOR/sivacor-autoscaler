@@ -31,6 +31,13 @@ class Config:
     dispatch_queue: str = "sivacor"
     girder_host: str | None = None
     worker_image: str | None = None
+    #: What a worker VM's celery subscribes to. ``None`` leaves the template's default,
+    #: ``sivacor,<its private queue>``. Set it to the private queue alone once this
+    #: deployment has armed targeted assignment and nothing publishes to the shared
+    #: queue -- and only then: a worker that has stopped consuming ``sivacor`` cannot
+    #: serve a submission dispatched the old way, so this is the step that ends the
+    #: one-flag rollback (P2 rollout step 4).
+    worker_queues: str | None = None
     image: str = "Featured-Ubuntu24"
     flavor: str = "m3.medium"
     network: str = "auto_allocated_network"
@@ -276,6 +283,7 @@ class Controller:
                     manager_ip=self.cfg.manager_ip,
                     girder_host=self.cfg.girder_host,
                     worker_image=self.cfg.worker_image,
+                    worker_queues=self.cfg.worker_queues,
                 )
                 fleet.create_instance(self.conn, self.cfg, user_data)
                 # A create that works is the only positive evidence that whatever

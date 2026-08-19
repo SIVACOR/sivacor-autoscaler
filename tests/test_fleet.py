@@ -43,6 +43,43 @@ def test_injects_secrets_and_manager_address():
 
 
 @pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
+def test_worker_queues_are_the_templates_default_unless_asked():
+    """Unset must leave `sivacor,<private queue>`, because the template is SHARED.
+
+    One checkout is bind-mounted by the mirror and by production, which sit at
+    different points of P2's rollout. If this injected anything by default, narrowing
+    the queues for the armed deployment would narrow them for the flag-off one too --
+    whose workers would then consume nothing while Girder kept publishing to `sivacor`,
+    stranding every submission with the fleet reading healthy.
+    """
+    # Scoped to the injected block: the template mentions WORKER_QUEUES itself, which
+    # is the point -- what must be absent is an injected assignment overriding it.
+    injected = _build().split("# ---- injected")[1].split("\n\n")[0]
+    assert "WORKER_QUEUES" not in injected
+
+
+@pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
+def test_worker_queues_are_injected_when_set():
+    """P2 rollout step 4, as a value rather than an edit to the shared template."""
+    ud = _build(worker_queues="private")
+    assert "WORKER_QUEUES=private" in ud
+
+
+@pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
+def test_the_template_still_defaults_the_queue_list_itself():
+    """The injected value has to reach a `${WORKER_QUEUES:-...}`, or it does nothing.
+
+    Pins the contract between this repo and deploy-sivacor's script: the marker sits
+    above the header, so an injected assignment is what the default falls back from.
+    """
+    text = TEMPLATE.read_text()
+    assert 'WORKER_QUEUES="${WORKER_QUEUES:-}"' in text, "header must accept an injection"
+    assert 'private)   WORKER_QUEUES="${WORKER_QUEUE}"' in text, "the rollout-step-4 value"
+    assert 'WORKER_QUEUES="sivacor,${WORKER_QUEUE}"' in text, "unset keeps both queues"
+    assert "--queues=${WORKER_QUEUES}" in text
+
+
+@pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
 def test_no_prepull_is_injected():
     """Workers stay interchangeable; see the P2.1/P3 note in build_user_data."""
     injected = _build().split("# ---- injected")[1].split("\n\n")[0]
