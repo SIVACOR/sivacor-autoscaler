@@ -6,9 +6,9 @@ Kept separate from :mod:`plan` so the arithmetic stays testable without a broker
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from .plan import RunningJob
+from .plan import RunningJob, WaitingSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -221,13 +221,19 @@ def running_jobs_by_instance(db, queue_prefix: str = "sivacor") -> dict[str, Run
     return out
 
 
-def unclaimed_submission_ages(db) -> tuple[timedelta, ...]:
-    """How long each RUNNING submission has gone without any worker claiming it.
+def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
+    """Every RUNNING submission that no worker has been given, with its age.
 
     The complement of :func:`spent_instance_ids`: submissions Girder has RUNNING that
     carry no ``meta.worker_queue`` at all. Every one of them is a submission nobody is
     working on, and each needs a worker -- which is demand that
     :func:`queue_depth` **cannot** see.
+
+    **One query serving two purposes, deliberately.** It is both the demand signal and
+    -- once ``Limits.assign`` is on -- the assigner's work list, because those are the
+    same question: whether the answer is "create an instance" or "use that one". Hence
+    the ``_id``, which nothing needed while the controller only counted. Two queries
+    would let the fleet size itself from one reading and place work from another.
 
     Why depth is not enough. Depth counts messages *sitting in the Redis list*. A
     message a worker has already reserved is gone from that list but not yet executing,
@@ -288,7 +294,11 @@ def unclaimed_submission_ages(db) -> tuple[timedelta, ...]:
                 },
                 {"created": 1},
             )
-            .sort("created", -1)
+            # Oldest first, and the direction is load-bearing now that this is the
+            # assigner's work list: newest-first plus a limit truncates away the head of
+            # the line S7 serves first, so past CLAIM_SCAN_LIMIT waiting submissions the
+            # oldest would be invisible and starve. Harmless while it was only a count.
+            .sort("created", 1)
             .limit(CLAIM_SCAN_LIMIT)
         )
     except Exception:
@@ -299,7 +309,7 @@ def unclaimed_submission_ages(db) -> tuple[timedelta, ...]:
         )
         return ()
 
-    ages: list[timedelta] = []
+    out: list[WaitingSubmission] = []
     for job in jobs:
         created = job.get("created")
         if created is None:
@@ -308,7 +318,10 @@ def unclaimed_submission_ages(db) -> tuple[timedelta, ...]:
             continue
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        ages.append(now - created)
-    if ages:
-        logger.debug("unclaimed submission ages: %s", sorted(ages))
-    return tuple(ages)
+        out.append(WaitingSubmission(id=str(job.get("_id")), age=now - created))
+    if out:
+        logger.debug(
+            "waiting submissions (oldest first): %s",
+            [(w.id, str(w.age)) for w in out],
+        )
+    return tuple(out)

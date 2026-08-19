@@ -21,7 +21,7 @@ from sivacor_autoscaler.signals import (
     ready_instance_ids,
     serving_count,
     spent_instance_ids,
-    unclaimed_submission_ages,
+    waiting_submissions,
 )
 
 
@@ -211,7 +211,7 @@ def test_ready_failure_propagates():
         ready_instance_ids(FakeRedis([], raises=True))
 
 
-# --- unclaimed submission ages ---------------------------------------------
+# --- waiting submissions: the demand signal and the assigner's work list ----
 
 
 def _job(minutes_old, *, aware=False, created=True):
@@ -223,22 +223,59 @@ def _job(minutes_old, *, aware=False, created=True):
     return doc
 
 
-def test_unclaimed_ages_measures_from_created():
+def test_a_waiting_submission_is_aged_from_created():
     db = FakeGirder([_job(5)])
-    (age,) = unclaimed_submission_ages(db)
-    assert timedelta(minutes=4) < age < timedelta(minutes=6)
+    (sub,) = waiting_submissions(db)
+    assert timedelta(minutes=4) < sub.age < timedelta(minutes=6)
 
 
-def test_unclaimed_ages_handles_naive_and_aware_alike():
+def test_the_submission_is_identified_not_merely_counted():
+    """The id is what makes this the assigner's input and not just a number.
+
+    ``_id`` is stringified here rather than left as an ObjectId: it travels into a log
+    line and a decision tuple, and the pure function that consumes it must not have to
+    know about pymongo's types.
+    """
+    (sub,) = waiting_submissions(FakeGirder([_job(5)]))
+    assert sub.id == "job-5"
+    assert isinstance(sub.id, str)
+
+
+def test_waiting_submissions_come_back_oldest_first():
+    """Matches S7's service order, so the log reads the way the decision runs."""
+    db = FakeGirder([_job(1), _job(9), _job(4)])
+    assert [s.id for s in waiting_submissions(db)] == ["job-1", "job-9", "job-4"], (
+        "the fake returns documents in insertion order, so this pins only that the "
+        "signal does not reorder them -- the ordering itself is Mongo's, pinned by "
+        "test_the_scan_window_keeps_the_oldest_submissions"
+    )
+
+
+def test_the_scan_window_keeps_the_oldest_submissions():
+    """Direction plus limit, and the pair is load-bearing once this places work.
+
+    Newest-first was harmless while the result was only counted. As the assigner's
+    work list it would truncate away the head of the line: past CLAIM_SCAN_LIMIT
+    waiting submissions, the oldest -- the very one S7 promises to serve next --
+    becomes invisible to the controller and starves.
+    """
+    db = FakeGirder([_job(5)])
+    waiting_submissions(db)
+    sorts = [c for c in db.calls if c[0] == "sort"]
+    assert sorts == [("sort", "created", 1)], "oldest first, exactly once"
+    assert ("limit", 100) in db.calls
+
+
+def test_waiting_ages_handle_naive_and_aware_alike():
     """Girder stores naive UTC; a tz-aware document must not be mis-aged by 5 hours.
 
     The whole reason this signal returns ages rather than timestamps -- doing the
     subtraction here, where the convention is known, instead of in plan.decide()
     where `now` may be naive local time.
     """
-    naive, = unclaimed_submission_ages(FakeGirder([_job(10)]))
-    aware, = unclaimed_submission_ages(FakeGirder([_job(10, aware=True)]))
-    assert abs(naive - aware) < timedelta(seconds=5)
+    naive, = waiting_submissions(FakeGirder([_job(10)]))
+    aware, = waiting_submissions(FakeGirder([_job(10, aware=True)]))
+    assert abs(naive.age - aware.age) < timedelta(seconds=5)
 
 
 def test_unclaimed_query_selects_running_and_unclaimed_only():
@@ -250,7 +287,7 @@ def test_unclaimed_query_selects_running_and_unclaimed_only():
     of unserved submission this signal exists to surface.
     """
     db = FakeGirder([_job(5)])
-    unclaimed_submission_ages(db)
+    waiting_submissions(db)
     (_, query, _), *_ = db.calls
     assert query["type"] == SUBMISSION_TYPE
     assert query["status"] == 2
@@ -260,7 +297,7 @@ def test_unclaimed_query_selects_running_and_unclaimed_only():
 
 def test_unclaimed_skips_undateable_documents():
     """An undateable job would otherwise read as infinitely old and provision forever."""
-    assert unclaimed_submission_ages(FakeGirder([_job(5, created=False)])) == ()
+    assert waiting_submissions(FakeGirder([_job(5, created=False)])) == ()
 
 
 def test_unclaimed_degrades_to_depth_only_rather_than_skipping_the_round():
@@ -271,4 +308,4 @@ def test_unclaimed_degrades_to_depth_only_rather_than_skipping_the_round():
     reap. See test_diagnostics.test_a_broken_diagnostics_query_still_reaps, which
     fails if this ever starts raising again.
     """
-    assert unclaimed_submission_ages(FakeGirder([], raises=True)) == ()
+    assert waiting_submissions(FakeGirder([], raises=True)) == ()

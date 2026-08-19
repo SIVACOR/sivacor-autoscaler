@@ -49,6 +49,32 @@ class RunningJob:
 
 
 @dataclass(frozen=True)
+class WaitingSubmission:
+    """A RUNNING submission that has not been given a worker yet.
+
+    Absence of ``meta.worker_queue`` is the marker. Under targeted assignment (S2 of
+    ``worker_sizing_plan.md``) the *controller* writes that field, so this set is both
+    the assigner's input and, unchanged, the demand signal that already scales the
+    fleet -- one query, one representation. See :attr:`FleetState.waiting`.
+
+    Ages rather than timestamps because Girder stores ``created`` naive while ``now``
+    here is tz-aware; :func:`signals.waiting_submissions` does the subtraction where
+    that convention is known.
+    """
+
+    #: The Girder job id, as a string. Carried so an assignment can name it; the
+    #: arithmetic uses it only as a stable tiebreaker.
+    id: str
+    age: timedelta
+
+    #: Advertised RAM the submission asked for, per ``meta.requested_memory_gb``.
+    #: ``None`` until P3 teaches the controller to read it -- at P2 the catalogue
+    #: holds one rung, so every submission fits every instance and the field is
+    #: deliberately unused by :func:`decide`.
+    memory_gb: int | None = None
+
+
+@dataclass(frozen=True)
 class Limits:
     #: Hard ceiling on worker instances. Configure it BELOW the OpenStack quota: the
     #: same 25 instances carry the manager, the test mirror and any hand-made debug
@@ -85,8 +111,11 @@ class Limits:
     provision_deadline: timedelta | None = None
 
     #: How long a RUNNING submission may sit unclaimed before it counts as demand in
-    #: its own right, independently of queue depth. See
-    #: :attr:`FleetState.unclaimed_ages`.
+    #: its own right, independently of queue depth. See :attr:`FleetState.waiting`.
+    #:
+    #: **Ignored entirely under :attr:`assign`**, where the race it skips cannot
+    #: happen: nothing is published until an instance has been chosen, so a waiting
+    #: submission is never a submission already being started.
     #:
     #: **The grace exists to skip one transient, not to be cautious.** A worker that
     #: has just reserved the head task is briefly both absent from the queue and
@@ -102,6 +131,44 @@ class Limits:
     #: submission outright.
     unclaimed_grace: timedelta = timedelta(minutes=2)
 
+    #: Arm targeted assignment: choose an instance per submission and publish the
+    #: chain to that instance's private queue (S2/S3 of ``worker_sizing_plan.md``).
+    #:
+    #: **Off by default, and it must be flipped together with Girder's own flag, never
+    #: alone.** With this on while ``submit_job`` still publishes to the shared queue,
+    #: a submission is both dispatched and assigned -- two workers, one workspace.
+    #: With it off while ``submit_job`` has stopped publishing, nothing ever reaches a
+    #: worker and the fleet looks like a healthy idle system while every submission
+    #: waits. That is why the flag is one value read by both processes rather than two
+    #: settings that can disagree; see P2's rollout order.
+    #:
+    #: Arming it also makes :attr:`FleetState.ready` load-bearing -- an unready
+    #: instance is never assigned to -- so the caller must populate ``ready`` whenever
+    #: this is on, independently of :attr:`provision_deadline`.
+    assign: bool = False
+
+    #: How old an instance may be and still receive its *first* assignment.
+    #:
+    #: The hazard: an instance nobody has assigned anything to is idle for its whole
+    #: life, so it powers itself off on its own schedule. Hand it work seconds before
+    #: that and the chain lands in a queue whose consumer disappears -- and because
+    #: ``meta.worker_queue`` is now set, the submission has left the waiting set and
+    #: become demand nothing can see, until the server-side reaper fails it up to 30
+    #: minutes later.
+    #:
+    #: **Sized against ``BOOT_GRACE_SEC``, not the idle timeout.** The supervisor
+    #: refuses to power off before 600 s of uptime (``worker-cloud-init.sh:86``), which
+    #: floors the earliest poweroff at 10 minutes even though the 300 s idle clock has
+    #: long expired -- checked on a 2 min timer, so in practice 600-720 s. Eight minutes
+    #: therefore stops assigning ~2 min before the first moment a poweroff is possible,
+    #: and leaves a ~5.5 min window (11 ticks) from the 122-140 s boot->ready.
+    #:
+    #: Refusing is the cheap direction -- the submission stays waiting, so it still
+    #: counts as demand and a fresh instance is created for it -- which is why a flat
+    #: ceiling is enough. Aged-out instances are excluded from *capacity* as well, or
+    #: the fleet deadlocks on capacity it will never assign to.
+    assign_max_age: timedelta = timedelta(minutes=8)
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -114,17 +181,27 @@ class FleetState:
     #: Ids of instances that have already claimed a submission and therefore no
     #: longer consume the dispatch queue. Empty is safe: the arithmetic degrades to
     #: the older, stall-prone ``depth + serving`` estimate rather than misbehaving.
+    #:
+    #: Under :attr:`Limits.assign` the *controller* writes that marker, so this means
+    #: "has been given a submission" rather than "has started one". The D9 skip below
+    #: still rests on evidence that celery worked, but by a different route: only a
+    #: :attr:`ready` instance is ever assigned to.
     spent: frozenset[str] = frozenset()
     #: Ids of instances whose celery worker started and reached the broker (D9).
-    #: Only consulted when :attr:`Limits.provision_deadline` is set; see there for
-    #: why that switch defaults to off.
+    #: Consulted when :attr:`Limits.provision_deadline` is set -- see there for why
+    #: that switch defaults to off -- **and** whenever :attr:`Limits.assign` is on,
+    #: because an instance that has not registered is never assigned work.
     ready: frozenset[str] = frozenset()
-    #: Age of every RUNNING submission that no worker has claimed -- demand that
+    #: Every RUNNING submission that no worker has been given -- demand that
     #: :attr:`queue_depth` cannot see, because a reserved-but-unstarted message has
-    #: already left the Redis list. Ages rather than timestamps so no naive/aware
-    #: comparison happens here; see :func:`signals.unclaimed_submission_ages`.
-    #: Empty degrades to the depth-only reading, i.e. the behaviour before it existed.
-    unclaimed_ages: tuple[timedelta, ...] = ()
+    #: already left the Redis list. Empty degrades to the depth-only reading, i.e. the
+    #: behaviour before it existed. See :func:`signals.waiting_submissions`.
+    #:
+    #: This is *also* the assigner's work list under :attr:`Limits.assign`, and
+    #: deliberately the same field: the demand signal and the assignment input are the
+    #: same Mongo query, so representing them twice would let the fleet size itself
+    #: from one reading and place work from another.
+    waiting: tuple[WaitingSubmission, ...] = ()
     #: Consecutive instances that came up but never registered with celery.
     consecutive_failures: int = 0
     #: Instance id -> the submission Girder still has RUNNING on it. Diagnostics only;
@@ -138,6 +215,12 @@ class FleetState:
 class Decision:
     create: int = 0
     delete: tuple[str, ...] = ()
+    #: ``(submission id, instance id)`` pairs to bind, oldest submission first (S7).
+    #: The caller claims each submission atomically and *then* publishes its chain to
+    #: that instance's private queue -- never the reverse order, which can publish the
+    #: same chain twice if the tick dies between the two. Empty unless
+    #: :attr:`Limits.assign` is on.
+    assign: tuple[tuple[str, str], ...] = ()
     #: Human-readable justification for every number above. Logged verbatim: this is
     #: the component whose decisions need to be auditable after the fact.
     reasons: tuple[str, ...] = field(default_factory=tuple)
@@ -189,11 +272,27 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     milliseconds after startup and before ``cancel_consumer`` can run. The spare
     instance simply idles and is reaped, so this over-provisions slightly rather than
     stalling -- the safe direction. Nothing downstream may assume one submission per
-    instance.
+    instance. (Under :attr:`Limits.assign` there is no shared queue to prefetch from,
+    which is what makes one-per-instance true rather than hoped for.)
 
     **Deletes are never gated on the breaker.** A tripped breaker means "stop spending
     money", so continuing to reap is the whole point; skipping it would leak the very
     instances that tripped it.
+
+    **Assignment is the same decision as capacity, which is why it lives here**
+    (S3 of ``worker_sizing_plan.md``). Under :attr:`Limits.assign` the function also
+    returns which waiting submission goes on which instance, oldest submission first
+    (S7). Putting it anywhere else would mean implementing that ordering twice, from two
+    snapshots taken at two different times, and the failure of the two disagreeing is
+    over-provisioning -- silent, and paid for in SUs. Here it is answerable by a unit
+    test with no OpenStack, no Mongo and no clock.
+
+    Capacity and assignability are deliberately *different* sets. A booting instance is
+    capacity, because it will serve; only an instance that has registered with the
+    broker is assignable, because a chain published to a queue that never gets a
+    consumer is a stall no signal can see. Instances past
+    :attr:`Limits.assign_max_age` are excluded from both -- one that will never be
+    assigned to must not absorb demand.
     """
     reasons: list[str] = []
     alerts: list[str] = []
@@ -209,10 +308,10 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     failed_to_provision: set[str] = set()
     if limits.provision_deadline is not None:
         for inst in live:
-            # A spent instance is never written off, whatever the markers say: it
-            # claimed a submission, which is positive proof its celery worked. The
-            # readiness write is best-effort on the worker side, so trusting it over
-            # an observed claim would be trusting the weaker signal.
+            # A spent instance is never written off, whatever the markers say: it holds
+            # a submission, which is positive proof its celery worked -- by claiming it,
+            # or by having been ready when the assigner chose it. The readiness write is
+            # best-effort, so trusting it over that would be trusting the weaker signal.
             if inst.created_at is None or inst.id in state.ready or inst.id in state.spent:
                 continue
             if now - inst.created_at > limits.provision_deadline:
@@ -280,25 +379,112 @@ def decide(state: FleetState, limits: Limits) -> Decision:
                 alarming=True,
             )
 
+    # --- assignment (S2) ---------------------------------------------------
+    # After the deletes, so a reaped instance is never handed work; before the creates,
+    # because an instance nothing will be assigned to is not capacity either.
+    assign: list[tuple[str, str]] = []
+    aged_out: set[str] = set()
+    if limits.assign:
+        unassigned = [
+            i
+            for i in live
+            if i.id not in state.spent
+            and i.id not in failed_to_provision
+            and i.id not in seen
+        ]
+        aged_out = {
+            i.id
+            for i in unassigned
+            if i.created_at is not None
+            and now - i.created_at > limits.assign_max_age
+        }
+        # Assignment is pessimistic where capacity is optimistic: a booting instance
+        # will serve, but only a broker-registered one is given work, because a chain
+        # published to an instance that never provisions sets `meta.worker_queue` -- so
+        # the submission leaves the waiting set and becomes demand no signal can see.
+        # That requirement is also what ties arming this to a worker image that
+        # announces readiness.
+        #
+        # Fleet instances only: the manager's static worker announces readiness too but
+        # is not an OpenStack server, so it never appears in `live`. A known gap for
+        # D6's oversized-package tail, which wants `sivacor.static-01` as a target.
+        assignable = [
+            i for i in unassigned if i.id not in aged_out and i.id in state.ready
+        ]
+        # Youngest first: an unassigned instance has been idle its whole life, so the
+        # youngest is furthest from its own poweroff. See assign_max_age.
+        assignable.sort(key=_youngest_first(now))
+        # Oldest submission first (S7). One size means everything fits everywhere, so a
+        # plain zip; P3 adds the size filter and the head-of-line stop.
+        for sub, inst in zip(_oldest_first(state.waiting), assignable):
+            assign.append((sub.id, inst.id))
+            reasons.append(
+                f"assign submission {sub.id} -> {inst.name}: waiting {sub.age}, "
+                f"oldest of {len(state.waiting)}"
+            )
+        if aged_out and state.waiting:
+            # Only worth saying in this combination. Ageing out with nothing waiting is
+            # routine -- an over-provisioned instance idling towards its own poweroff --
+            # but work waiting while an instance sits unassignable is never a busy
+            # fleet.
+            line = (
+                f"{len(aged_out)} instance(s) too old to assign while "
+                f"{len(state.waiting)} submission(s) wait: past "
+                f"{limits.assign_max_age} they may power themselves off at any tick, "
+                "so they are excluded from capacity too and replaced ("
+                + ", ".join(sorted(i.name for i in live if i.id in aged_out))
+                + ")"
+            )
+            reasons.append(line)
+            alerts.append(line)
+        elif state.waiting and not assignable:
+            # Routine on an empty fleet -- the tick before the instances exist -- but
+            # it is the only line that distinguishes that from the arming failure where
+            # nothing is ever assignable because no worker announces readiness.
+            reasons.append(
+                f"{len(state.waiting)} submission(s) waiting, none assignable: "
+                f"{len(live)} live, {len([i for i in live if i.id in state.spent])} "
+                f"already assigned, {len([i for i in live if i.id in state.ready])} "
+                f"registered with the broker"
+            )
+
     # --- creates -----------------------------------------------------------
     # Instances remaining after this round's deletions still occupy their slots
     # until OpenStack actually removes them, so count conservatively against the cap.
+    # `aged_out` (empty unless assignment is armed) must go here as well as out of
+    # `assignable`: capacity nothing will ever be assigned to absorbs demand forever,
+    # which is the run-3/run-5 stall through a new door.
     available = [
-        i for i in live if i.id not in state.spent and i.id not in failed_to_provision
+        i
+        for i in live
+        if i.id not in state.spent
+        and i.id not in failed_to_provision
+        and i.id not in aged_out
     ]
     # Demand is the *larger* of the two readings, never their sum: a submission
     # waiting in the queue is also RUNNING-and-unclaimed in Girder, so adding them
     # would double-count every ordinary submit and provision twice over. Taking the
     # max means depth still drives the normal case, while a submission depth has lost
     # sight of -- reserved by a worker that cannot start it -- still gets an instance.
-    stalled = tuple(a for a in state.unclaimed_ages if a > limits.unclaimed_grace)
-    demand = max(state.queue_depth, len(stalled))
-    if len(stalled) > state.queue_depth:
-        # The dispatch queue is not showing work that Girder says is unserved. Always
-        # an anomaly: either a worker is holding a message it will not run, or a
-        # submission was published to a queue nobody consumes. Appended to BOTH lists
-        # because `alerts` is documented as a severity view *over* `reasons`, not a
-        # second bucket -- an alert missing from the audit trail would be a bug.
+    if limits.assign:
+        # No grace: it exists to skip the reserve-to-claim window, which S2 removes
+        # outright, and keeping it would delay every submission by two minutes. Still
+        # max() against depth, because rollout step 3 runs both paths and a dispatched
+        # submission is also unassigned.
+        stalled = state.waiting
+        demand = max(state.queue_depth, len(state.waiting))
+    else:
+        stalled = tuple(w for w in state.waiting if w.age > limits.unclaimed_grace)
+        demand = max(state.queue_depth, len(stalled))
+    if not limits.assign and len(stalled) > state.queue_depth:
+        # The dispatch queue is not showing work that Girder says is unserved. An
+        # anomaly *while submissions are dispatched blind*: either a worker is holding a
+        # message it will not run, or a submission was published to a queue nobody
+        # consumes. Hence the flag in the condition -- once assignment is armed the same
+        # reading is the design, and would fire on every tick of a healthy fleet.
+        # Appended to BOTH lists because `alerts` is documented as a severity view
+        # *over* `reasons`, not a second bucket -- an alert missing from the audit trail
+        # would be a bug.
         line = (
             f"{len(stalled)} submission(s) unclaimed for over {limits.unclaimed_grace} "
             f"but depth={state.queue_depth}: the dispatch queue has lost sight of "
@@ -347,12 +533,45 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     return Decision(
         create=create,
         delete=tuple(delete),
+        assign=tuple(assign),
         reasons=tuple(reasons),
         alerts=tuple(alerts),
         abnormal=frozenset(abnormal),
         reap_reasons=reap_reasons,
     )
 
+
+
+def _oldest_first(waiting) -> tuple[WaitingSubmission, ...]:
+    """Waiting submissions in the order S7 says they must be served.
+
+    Oldest first, and the id as a tiebreaker so two submissions created in the same
+    millisecond still order deterministically -- a decision that changes between ticks
+    for no observable reason is one nobody can debug from the log.
+    """
+    return tuple(sorted(waiting, key=lambda w: (-w.age, w.id)))
+
+
+def _youngest_first(now):
+    """Sort key putting the instance with the most life left in it first.
+
+    A worker's supervisor refuses to power off before ``BOOT_GRACE_SEC`` of *uptime*, so
+    for an unassigned instance the time left is a direct function of its age: youngest
+    is furthest from poweroff. See ``Limits.assign_max_age``.
+
+    An undated instance sorts last rather than first. It was probably created moments
+    ago, but it is also the one whose age cannot be checked against the ceiling, and
+    preferring a candidate because less is known about it is the wrong instinct.
+    """
+
+    def key(inst):
+        if inst.created_at is None:
+            return (1, timedelta(0), inst.id)
+        # Smallest age first, i.e. youngest first. The leading 0/1 is what keeps the
+        # undated instance behind every dated one regardless of its age.
+        return (0, now - inst.created_at, inst.id)
+
+    return key
 
 
 def _unclaimed_note(stalled) -> str:

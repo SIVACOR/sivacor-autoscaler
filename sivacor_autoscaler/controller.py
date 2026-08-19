@@ -112,24 +112,27 @@ class Controller:
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
             spent=self._spent(instances),
-            # Demand that queue_depth structurally cannot see: a submission whose
-            # message a worker has reserved but cannot start is absent from the Redis
-            # list while being just as unserved. Swallows its own errors, like
-            # running_jobs_by_instance: it must not be able to skip a round, because a
-            # round that does not happen is a round that does not reap.
-            unclaimed_ages=signals.unclaimed_submission_ages(self.db),
-            # Diagnostics only, and it swallows its own errors: it must not be able to
-            # skip a round, because a round that does not happen is a round that does
-            # not reap.
+            # Demand queue_depth cannot see -- a message a worker reserved but cannot
+            # start has left the Redis list while being just as unserved -- and, under
+            # Limits.assign, the assigner's work list too: one query, so capacity and
+            # placement cannot be decided from two readings a tick apart. Swallows its
+            # own errors: () under-provisions for one round and assigns nothing, whereas
+            # raising would skip the round, and a round that does not happen is a round
+            # that does not reap.
+            waiting=signals.waiting_submissions(self.db),
+            # Diagnostics only, and swallows its own errors for the same reason.
             running_jobs=signals.running_jobs_by_instance(
                 self.db, self.cfg.dispatch_queue
             ),
-            # Only read when the deadline check is armed. Skipping the call when it is
-            # disabled keeps a Redis hiccup from failing rounds for a signal nothing
-            # would have consulted -- gather() is all-or-nothing by design.
+            # Only read when something will consult it: gather() is all-or-nothing, so
+            # an unused signal must not be able to fail a round. Assignment makes it
+            # mandatory, which is easy to miss because the deadline check is off in
+            # production -- an unregistered instance is never assigned to, so an empty
+            # set here assigns nothing, forever, while every other number reads healthy.
             ready=(
                 signals.ready_instance_ids(self.redis)
                 if self.cfg.limits.provision_deadline is not None
+                or self.cfg.limits.assign
                 else frozenset()
             ),
             instances=instances,
@@ -186,6 +189,17 @@ class Controller:
                 logger.info("%s", reason)
         for alert in decision.alerts:
             logger.warning("%s", alert)
+
+        if decision.assign:
+            # The executor -- claim, then publish to the instance's private queue -- is
+            # the second half of P2. Loud rather than silent: a decision nothing acts on
+            # is how two changes in autoscaling_plan.md shipped inert. Unreachable
+            # today, because Limits.assign cannot be turned on.
+            logger.error(
+                "assignment is armed but this build cannot execute it: %d binding(s) "
+                "decided and dropped. Turn Limits.assign off until the assigner lands.",
+                len(decision.assign),
+            )
 
         by_id = {i.id: i for i in state.instances}
 

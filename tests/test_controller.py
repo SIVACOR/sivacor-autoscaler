@@ -12,7 +12,7 @@ from pathlib import Path
 
 from sivacor_autoscaler import controller as controller_mod
 from sivacor_autoscaler.controller import Config, Controller
-from sivacor_autoscaler.plan import Decision, FleetState, Instance
+from sivacor_autoscaler.plan import Decision, FleetState, Instance, Limits
 
 NOW = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc)
 
@@ -213,3 +213,62 @@ def test_a_quiet_controller_never_reopens_anything(monkeypatch):
     ctl = controller([])
     ctl._expire_breaker()
     assert ctl.consecutive_failures == 0 and ctl._last_failure is None
+
+
+# --- what gather() must read once assignment is armed ----------------------
+
+
+class CountingRedis(FakeRedis):
+    """Records whether the readiness markers were read at all."""
+
+    def __init__(self):
+        self.key_patterns = []
+
+    def keys(self, pattern):
+        self.key_patterns.append(pattern)
+        return []
+
+
+class EmptyCloud:
+    """An OpenStack connection with no servers in it; gather() lists the fleet first."""
+
+    class compute:
+        @staticmethod
+        def servers(details=True):
+            return []
+
+
+def _controller_with(redis, limits):
+    cfg = Config(
+        template=Path("/nonexistent"),
+        manager_ip="10.0.0.1",
+        master_key_hex="ab",
+        redis_password="pw",
+        deployment="test.sivacor.org",
+        limits=limits,
+    )
+    return Controller(EmptyCloud(), redis, FakeGirder([]), cfg)
+
+
+def test_readiness_is_read_when_assignment_is_armed():
+    """Deadlock-shaped if this regresses, and invisible from every other number.
+
+    An instance that has not registered with the broker is never assigned to, so an
+    empty ``ready`` set means nothing is ever assignable -- while depth, live, spent and
+    serving all read exactly as they do on a healthy idle fleet. The production
+    ``provision_deadline`` is ``None``, so the pre-existing condition alone would have
+    left this signal unread precisely when it became load-bearing.
+    """
+    redis = CountingRedis()
+    _controller_with(redis, Limits(assign=True)).gather()
+
+    assert redis.key_patterns == ["sivacor:ready:*"]
+
+
+def test_readiness_is_left_unread_when_nothing_will_consult_it():
+    """gather() is all-or-nothing, so an unused signal must not be able to fail a round."""
+    redis = CountingRedis()
+    state = _controller_with(redis, Limits()).gather()
+
+    assert redis.key_patterns == []
+    assert state.ready == frozenset()
