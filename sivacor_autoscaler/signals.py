@@ -29,9 +29,25 @@ JOB_RUNNING = 2
 #:    so it returned ``200`` and ``[]`` on every tick, silently, for the controller's
 #:    entire life. That cost an 18 min 09 s stall before anyone noticed (plan run 5).
 #:    A query has no such hidden scoping.
-#: 3. **Reads only.** P0.5's warning about staying on HTTP applies to *writes*: failing a
-#:    submission has to fire ``jobs.job.update.after``, which is bound only in the Girder
-#:    server process. Nothing here writes, so that constraint does not bind.
+#: 3. **Reads only -- for now, and this is the sentence that expires.** P0.5's warning
+#:    about staying on HTTP applies to *writes*: failing a submission has to fire
+#:    ``jobs.job.update.after``, which is bound only in the Girder server process.
+#:    Nothing here writes, so that constraint does not bind -- but S2/S3 of
+#:    ``worker_sizing_plan.md`` make this process the *assigner*, and its first
+#:    ``meta.worker_queue`` write ends that. The replacement rule is already known
+#:    rather than guessed: it was measured in the deployed controller container on
+#:    2026-08-19 (that plan's open item 6).
+#:
+#:    * Girder's model layer needs nothing bootstrapped beyond ``GIRDER_MONGO_URI``:
+#:      ``config.getConfig()`` resolves the database uri from it, with no ``girder.cfg``
+#:      and no plugin load.
+#:    * ``SIVACORPlugin.load()`` never runs here, so **not one girder_sivacor handler is
+#:      bound**. Girder *core* handlers are -- the models bind them themselves -- so "no
+#:      event fires in the controller" is the wrong way to say it, and saying it that way
+#:      invites someone to trust a model call whose side effect the plugin owns.
+#:    * So: a raw ``update_one`` on ``meta.*`` is safe from here, and ``updateJob()`` is
+#:      not. Job *status*, the submission folder's status and the researcher's email stay
+#:      Girder's alone -- from this process they would silently not happen.
 #:
 #: The cost is coupling to Girder's schema instead of its API. Mild: the collection and
 #: the ``type``/``status`` fields are stable, and ``meta.worker_queue`` is SIVACOR's own.
