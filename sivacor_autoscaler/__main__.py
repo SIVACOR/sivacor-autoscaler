@@ -218,11 +218,11 @@ def main() -> int:
     else:
         logging.getLogger(__name__).info(
             "quota headroom is the instance count alone (max_instances=%s); "
-            "SIVACOR_MAX_VCPUS and SIVACOR_MAX_RAM_GB are unset. Correct while every "
-            "worker is one shape -- the count binds at the bottom rung and only there "
-            "-- but it stops bounding cost once sizes differ: at 125 GiB the RAM quota "
-            "binds at nine instances, not %s (S6, superseding D3)",
-            cfg.limits.max_instances,
+            "SIVACOR_MAX_VCPUS and SIVACOR_MAX_RAM_GB are unset. Safe only while "
+            "max_instances is the SMALLER limit, and which one is smaller depends on "
+            "the shapes in play: the allocation's 320 vCPU / 1220 GiB is ~40 instances "
+            "at the 30 GiB rung but only ~9 at 125 GiB. Set both once the catalogue "
+            "offers a rung where that arithmetic turns over (S6, superseding D3)",
             cfg.limits.max_instances,
         )
 
