@@ -155,7 +155,7 @@ def _armed(monkeypatch, ctl, conn):
     """Point the controller's create path at `conn`, bypassing OpenStack entirely."""
     monkeypatch.setattr(controller_mod.fleet, "build_user_data", lambda *a, **k: "#!/bin/bash\n")
 
-    def create_instance(_conn, _cfg, _user_data):
+    def create_instance(_conn, _cfg, _user_data, flavor=None, size=None):
         conn.creates += 1
         if conn.fail:
             raise RuntimeError("user_data is 65600 bytes encoded, over Nova's 65535")
@@ -434,3 +434,35 @@ def test_the_arm_flag_line_says_state_at_startup_and_change_on_a_flip(monkeypatc
         caplog.clear()
         ctl.limits()
         assert caplog.text == ""
+
+
+# --- the catalogue reaches the arithmetic (P3.2) ----------------------------
+
+
+def test_the_catalogue_reaches_decide_as_limits_sizes():
+    """The seam. `plan` cannot read Girder and `catalogue` cannot do arithmetic, so if
+    this hand-off is wrong the per-size path silently never runs and the fleet quietly
+    boots one shape for everything -- which is exactly the pre-P3 bug P3 exists to fix.
+    """
+    from sivacor_autoscaler import catalogue
+
+    ctl = controller([])
+    ctl.rungs = (catalogue.Rung(30, "m3.medium", 8), catalogue.Rung(60, "m3.large", 16))
+
+    limits = ctl.limits()
+
+    assert [s.memory_gb for s in limits.sizes] == [30, 60]
+    assert [s.vcpus for s in limits.sizes] == [8, 16]
+
+
+def test_no_catalogue_means_no_sizes_which_is_the_pre_p3_path():
+    assert controller([]).limits().sizes == ()
+
+
+def test_the_flavour_map_lets_an_untagged_instance_be_placed():
+    from sivacor_autoscaler import catalogue
+
+    ctl = controller([])
+    ctl.rungs = (catalogue.Rung(30, "m3.medium", 8), catalogue.Rung(60, "m3.large", 16))
+
+    assert ctl._flavor_sizes() == {"m3.medium": 30, "m3.large": 60}

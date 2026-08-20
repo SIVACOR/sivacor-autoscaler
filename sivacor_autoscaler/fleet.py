@@ -56,6 +56,58 @@ def deployment_tag(deployment: str) -> str:
     """The per-deployment tag for ``deployment`` (typically the stack's ``domain``)."""
     return f"{DEPLOYMENT_TAG_PREFIX}{deployment}"
 
+
+#: Which catalogue rung an instance is, as a tag: ``sivacor-size:60``.
+#:
+#: A *third* tag is safe because :func:`list_fleet` filters on tag **subset** -- it
+#: requires :data:`FLEET_TAG` and the deployment tag to be present and ignores anything
+#: else -- so instances predating this carry two tags and are matched exactly as before.
+#: Their size reads as ``None``, which :func:`plan._instance_rung` resolves to the
+#: cheapest rung.
+#:
+#: Tagged rather than kept in metadata because ``list_fleet`` already reads tags for
+#: every instance on every tick, so this costs no extra call. The human-facing copy goes
+#: to metadata alongside the existing role/deployment properties, which is what
+#: ``openstack server show`` prints.
+SIZE_TAG_PREFIX = "sivacor-size:"
+
+
+def size_tag(memory_gb: int) -> str:
+    return f"{SIZE_TAG_PREFIX}{memory_gb}"
+
+
+def _flavor_name(server) -> str | None:
+    """The flavour's name from a detailed server listing, or ``None``.
+
+    Nova returns the flavour as a nested object whose name lives in ``original_name``;
+    ``name`` on some microversions; and the whole attribute can be absent. None of those
+    are worth an exception when the size tag is the primary source.
+    """
+    flavor = getattr(server, "flavor", None)
+    if flavor is None:
+        return None
+    if isinstance(flavor, dict):
+        return flavor.get("original_name") or flavor.get("name")
+    return getattr(flavor, "original_name", None) or getattr(flavor, "name", None)
+
+
+def _size_from(tags, flavor_name, flavor_sizes) -> int | None:
+    """Which rung an instance is: its tag, else its flavour name, else unknown.
+
+    The flavour fallback exists because it costs nothing -- ``servers(details=True)``
+    already returns the flavour and :func:`list_fleet` used to discard it -- and it
+    covers the one case the tag cannot: an instance booted before this tag existed, or
+    by hand. ``None`` is a legitimate answer and callers must handle it; see
+    :attr:`plan.Instance.size`.
+    """
+    for tag in tags:
+        if tag.startswith(SIZE_TAG_PREFIX):
+            try:
+                return int(tag[len(SIZE_TAG_PREFIX) :])
+            except ValueError:
+                logger.warning("ignoring unparseable size tag %r", tag)
+    return flavor_sizes.get(flavor_name)
+
 #: Nova's ceiling on the base64-encoded user_data blob.
 USER_DATA_LIMIT = 65535
 
@@ -79,6 +131,7 @@ def build_user_data(
     girder_host: str | None = None,
     worker_image: str | None = None,
     worker_queues: str | None = None,
+    worker_size: int | None = None,
 ) -> str:
     """Inject configuration into the cloud-init template.
 
@@ -115,10 +168,21 @@ def build_user_data(
         # one that has not must not, and since both share one template file that
         # decision has to travel as a value rather than an edit.
         lines.append(f"WORKER_QUEUES={shlex.quote(worker_queues)}")
+    if worker_size is not None:
+        # Informational on the box: nothing in the worker's startup branches on it. The
+        # flavour already decided the hardware, and the container's memory cap is
+        # derived from what the kernel reports rather than from anything told to it
+        # (`lib.py::container_memory_limit`), which is why the OOM message can quote a
+        # real `mem_limit_bytes`. This is here so `openstack console log show` and the
+        # worker's own journal say which rung the controller believed it was booting --
+        # the one place that belief and the hardware could silently disagree.
+        lines.append(f"SIVACOR_WORKER_SIZE={shlex.quote(str(worker_size))}")
     return text.replace(INJECT_MARKER, "\n".join(lines))
 
 
-def list_fleet(conn, deployment: str) -> tuple[Instance, ...]:
+def list_fleet(
+    conn, deployment: str, flavor_sizes: dict[str, int] | None = None
+) -> tuple[Instance, ...]:
     """Every worker instance of ``deployment``, whatever its state.
 
     SHUTOFF ones matter as much as live ones: they are what the reap step exists for,
@@ -131,6 +195,9 @@ def list_fleet(conn, deployment: str) -> tuple[Instance, ...]:
     say so, because an instance no controller claims is one nothing will ever reap.
     """
     wanted = deployment_tag(deployment)
+    # flavour name -> rung, so an instance with no size tag can still be placed. Empty
+    # means "do not try", which is every caller before P3.
+    flavor_sizes = flavor_sizes or {}
     out = []
     for s in conn.compute.servers(details=True):
         tags = set(s.tags or ())
@@ -155,13 +222,26 @@ def list_fleet(conn, deployment: str) -> tuple[Instance, ...]:
                 name=s.name or s.id,
                 status=s.status or "UNKNOWN",
                 created_at=_parse_time(s.created_at),
+                # `s.flavor` is an object on a detailed listing and `original_name` is
+                # the flavour's name, which is what the catalogue keys on. Guarded at
+                # every step: the attribute is absent on older microversions, and the
+                # size tag is the primary source anyway -- a missing flavour here costs
+                # a fallback, not a listing.
+                size=_size_from(tags, _flavor_name(s), flavor_sizes),
             )
         )
     return tuple(out)
 
 
-def create_instance(conn, cfg, user_data: str) -> str:
+def create_instance(
+    conn, cfg, user_data: str, flavor: str | None = None, size: int | None = None
+) -> str:
     """Boot one worker. Returns its id.
+
+    ``flavor`` overrides ``cfg.flavor`` for this one instance -- that is what makes the
+    fleet heterogeneous -- and ``size`` is the catalogue rung it corresponds to, written
+    as a tag so :func:`list_fleet` can read it back without a flavour lookup. Both
+    default to the pre-P3 behaviour: one configured flavour, no size tag.
 
     Raises :class:`QuotaExceeded` when the allocation is full so the caller can treat
     it as backpressure rather than failure.
@@ -188,10 +268,11 @@ def create_instance(conn, cfg, user_data: str) -> str:
         )
 
     name = f"sivacor-worker-{uuid.uuid4().hex[:8]}"
+    want_flavor = flavor or cfg.flavor
     kwargs = {
         "name": name,
         "image_id": _require(conn.compute.find_image, cfg.image, "image"),
-        "flavor_id": _require(conn.compute.find_flavor, cfg.flavor, "flavor"),
+        "flavor_id": _require(conn.compute.find_flavor, want_flavor, "flavor"),
         "networks": [{"uuid": _require(conn.network.find_network, cfg.network, "net")}],
         # Base64 because compute.create_server passes user_data through verbatim --
         # only the higher-level conn.create_server() encodes, and that one would
@@ -200,10 +281,16 @@ def create_instance(conn, cfg, user_data: str) -> str:
         # Both tags, always. list_fleet() requires both, so an instance created with
         # only FLEET_TAG would be invisible to its own controller: never counted, never
         # reaped, and holding a quota slot until a human noticed.
-        "tags": [FLEET_TAG, deployment_tag(cfg.deployment)],
+        "tags": [FLEET_TAG, deployment_tag(cfg.deployment)]
+        + ([size_tag(size)] if size is not None else []),
         # Metadata rather than tags for the human-facing copy: `openstack server show`
         # prints properties in full, which is where anyone debugging looks first.
-        "metadata": {"sivacor_role": "worker", "sivacor_deployment": cfg.deployment},
+        "metadata": {
+            "sivacor_role": "worker",
+            "sivacor_deployment": cfg.deployment,
+            "sivacor_flavor": want_flavor,
+            **({"sivacor_size_gb": str(size)} if size is not None else {}),
+        },
     }
     if cfg.key_name:
         kwargs["key_name"] = cfg.key_name
@@ -216,7 +303,13 @@ def create_instance(conn, cfg, user_data: str) -> str:
         if _is_quota_error(exc):
             raise QuotaExceeded(str(exc)) from exc
         raise
-    logger.info("created %s (%s)", name, server.id)
+    logger.info(
+        "created %s (%s) as %s%s",
+        name,
+        server.id,
+        want_flavor,
+        f", size {size} GB" if size is not None else "",
+    )
     return server.id
 
 

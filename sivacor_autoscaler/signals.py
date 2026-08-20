@@ -325,7 +325,15 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
                     "status": JOB_RUNNING,
                     "meta.worker_queue": None,
                 },
-                {"created": 1, "meta.awaiting_assignment": 1},
+                {
+                    "created": 1,
+                    "meta.awaiting_assignment": 1,
+                    # P1 records what the researcher asked for; P3 is where the fleet
+                    # finally reads it. One extra projection field on a query that
+                    # already runs -- the whole point of demand and placement being one
+                    # query is that adding a dimension costs nothing here.
+                    "meta.requested_memory_gb": 1,
+                },
             )
             # Oldest first, and the direction is load-bearing now that this is the
             # assigner's work list: newest-first plus a limit truncates away the head of
@@ -351,6 +359,8 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
             continue
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
+        meta = job.get("meta") or {}
+        requested = meta.get("requested_memory_gb")
         out.append(
             WaitingSubmission(
                 id=str(job.get("_id")),
@@ -358,7 +368,12 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
                 # Missing means the submission predates the marker, i.e. it was
                 # dispatched to the shared queue: demand, but not ours to place.
                 # Defaulting the other way would publish a second chain for it.
-                assignable=bool((job.get("meta") or {}).get("awaiting_assignment")),
+                assignable=bool(meta.get("awaiting_assignment")),
+                # Missing means the submission predates P1. Left as None rather than
+                # defaulted here: `plan._submission_rung` owns that choice, because the
+                # cheapest rung is only knowable from the catalogue, which this module
+                # deliberately does not read.
+                memory_gb=int(requested) if isinstance(requested, (int, float)) else None,
             )
         )
     if out:

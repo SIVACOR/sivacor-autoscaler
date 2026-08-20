@@ -390,3 +390,39 @@ def test_the_marker_is_projected_or_every_submission_reads_as_ours():
 
     (find,) = [c for c in db.calls if c[0] == "find"]
     assert "meta.awaiting_assignment" in find[2]
+
+
+# --- the requested size (P3) -----------------------------------------------
+
+
+def _sized_job(minutes_old, requested):
+    doc = _job(minutes_old)
+    doc["meta"] = {"awaiting_assignment": True, "requested_memory_gb": requested}
+    return doc
+
+
+def test_the_requested_size_reaches_the_arithmetic():
+    """P1 recorded it and P2 left it unread; this is the read."""
+    (sub,) = waiting_submissions(FakeGirder([_sized_job(5, 60)]))
+    assert sub.memory_gb == 60
+
+
+def test_a_submission_predating_p1_has_no_size():
+    """Left as None rather than defaulted: the cheapest rung is only knowable from the
+    catalogue, and this module deliberately does not read it. plan owns that choice."""
+    (sub,) = waiting_submissions(FakeGirder([_job(5)]))
+    assert sub.memory_gb is None
+
+
+def test_a_nonsense_size_is_treated_as_absent_not_crashed():
+    """A listing that raises is a round that neither scales nor reaps, so a junk value
+    in one document must not cost the whole tick."""
+    (sub,) = waiting_submissions(FakeGirder([_sized_job(5, "sixty")]))
+    assert sub.memory_gb is None
+
+
+def test_a_float_size_is_coerced():
+    """Mongo can hand back a number written as a double; the rung is an int everywhere."""
+    (sub,) = waiting_submissions(FakeGirder([_sized_job(5, 60.0)]))
+    assert sub.memory_gb == 60
+    assert isinstance(sub.memory_gb, int)

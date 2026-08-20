@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import diagnostics, dispatch, fleet, signals
+from . import catalogue, diagnostics, dispatch, fleet, signals
 from .plan import FleetState, Limits, decide
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,18 @@ class Controller:
         #: takes part in and it happens with no restart and no deploy, so it must
         #: leave a line in the log to correlate an incident against.
         self._armed: bool | None = None
+        #: The worker-size catalogue, read once at startup and validated against Nova.
+        #:
+        #: **Startup rather than per-tick, unlike the arm flag, and the asymmetry is
+        #: deliberate.** The arm flag must be per-tick because both processes have to
+        #: agree about it within one interval. The catalogue must not be, because
+        #: :func:`catalogue.validate` is what stands between a typo and a tripped
+        #: circuit breaker -- three failed creates stop the entire fleet (P1) -- and a
+        #: check that runs at startup fails loudly on one deployment, while a check that
+        #: runs per-tick would either re-hit Nova every 30 s or be skipped. Editing the
+        #: catalogue therefore requires a restart of this service, which is stated in
+        #: ENVIRONMENT.md.
+        self.rungs: tuple = ()
 
     def _spent(self, instances) -> frozenset[str]:
         """Instance ids that have claimed a submission, monotonically.
@@ -116,6 +128,20 @@ class Controller:
         self._spent_seen &= known
         return frozenset(self._spent_seen)
 
+    def load_catalogue(self) -> None:
+        """Read the size catalogue and check it against Nova. Raises to stop the process.
+
+        Called once, before the loop. See :attr:`rungs` for why this is not per-tick,
+        and :func:`catalogue.validate` for the three failures it turns into a boot error
+        instead of a silently wrong fleet.
+        """
+        self.rungs = catalogue.load()
+        catalogue.validate(self.conn, self.rungs)
+
+    def _flavor_sizes(self) -> dict[str, int]:
+        """flavour name -> rung, so an untagged instance can still be placed."""
+        return {r.flavor: r.memory_gb for r in self.rungs}
+
     def limits(self) -> Limits:
         """This tick's limits, with ``assign`` taken from Girder's setting.
 
@@ -126,6 +152,7 @@ class Controller:
         so a flip mid-round cannot make those two disagree either.
         """
         armed = signals.targeted_assignment(self.db)
+        sizes = catalogue.specs(self.rungs)
         if armed != self._armed:
             # The first reading is a statement of state, not a transition. "now OFF ...
             # no longer" at startup reads as though someone had just disarmed it, which
@@ -144,13 +171,15 @@ class Controller:
                 ),
             )
             self._armed = armed
-        return replace(self.cfg.limits, assign=armed)
+        return replace(self.cfg.limits, assign=armed, sizes=sizes)
 
     def gather(self, limits: Limits | None = None) -> FleetState:
         limits = self.cfg.limits if limits is None else limits
         # Instances first: _spent() prunes against them, and an id OpenStack no longer
         # reports must not linger in the cache.
-        instances = fleet.list_fleet(self.conn, self.cfg.deployment)
+        instances = fleet.list_fleet(
+            self.conn, self.cfg.deployment, self._flavor_sizes()
+        )
         return FleetState(
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
@@ -277,22 +306,10 @@ class Controller:
         for rung in decision.create:
             try:
                 # `rung` is the catalogue size this instance must be, or None for
-                # "unsized" -- demand read from queue depth, which carries no size.
-                #
-                # **Every rung is None until P3.2 wires the catalogue**, because
-                # `decide()` only emits sized creates when `Limits.sizes` is non-empty
-                # and nothing populates it yet. So the flavour below is still the one
-                # `SIVACOR_OS_FLAVOR` names, exactly as before, and this loop is a
-                # rename of `range(decision.create)`. Asserting it rather than
-                # commenting it: a sized rung arriving here before the mapping exists
-                # would silently boot the wrong shape.
-                if rung is not None:
-                    logger.warning(
-                        "decision asked for a %s GB instance but this build has no "
-                        "size->flavor mapping yet (P3.2); booting %s regardless",
-                        rung,
-                        self.cfg.flavor,
-                    )
+                # "unsized" -- demand read from queue depth, which carries no size, and
+                # so only reachable while targeted assignment is off. Those get
+                # `SIVACOR_OS_FLAVOR`, which is the pre-P3 behaviour for the pre-P3 path.
+                want_flavor = catalogue.flavor_for(self.rungs, rung, self.cfg.flavor)
                 user_data = fleet.build_user_data(
                     self.cfg.template,
                     master_key_hex=self.cfg.master_key_hex,
@@ -301,8 +318,11 @@ class Controller:
                     girder_host=self.cfg.girder_host,
                     worker_image=self.cfg.worker_image,
                     worker_queues=self.cfg.worker_queues,
+                    worker_size=rung,
                 )
-                fleet.create_instance(self.conn, self.cfg, user_data)
+                fleet.create_instance(
+                    self.conn, self.cfg, user_data, flavor=want_flavor, size=rung
+                )
                 # A create that works is the only positive evidence that whatever
                 # tripped the breaker is over. Nothing else cleared this counter
                 # before 2026-08-12.

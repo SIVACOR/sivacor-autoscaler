@@ -83,6 +83,18 @@ def build_config() -> Config:
                 if (mins := _env("SIVACOR_PROVISION_DEADLINE_MINUTES"))
                 else None
             ),
+            # S6's other two quota dimensions. Unset = that check is off, which is the
+            # pre-P3 behaviour and correct for a uniform fleet (D3): the instance count
+            # binds at the bottom rung and only there.
+            #
+            # Set them **below** the real OpenStack quota, for the same reason
+            # max_instances is: the same 320 vCPU / 1220 GiB carry the manager, the test
+            # mirror and any hand-made debug VM, so deriving these from the quota
+            # guarantees a collision with ordinary work. Live quota 2026-08-20:
+            # 25 instances / 320 vCPU / 1220 GiB, with 3 / 12 / 45 GiB already in use by
+            # the two managers.
+            max_vcpus=(int(v) if (v := _env("SIVACOR_MAX_VCPUS")) else None),
+            max_ram_gb=(int(v) if (v := _env("SIVACOR_MAX_RAM_GB")) else None),
         ),
     )
 
@@ -232,6 +244,23 @@ def main() -> int:
     db = mongo.get_default_database()
 
     controller = Controller(conn, redis_client, db, cfg)
+
+    # Before anything is created, and fatal on failure. The catalogue names flavours
+    # this process will hand to Nova, and an unknown one raises inside create_instance,
+    # which counts towards the circuit breaker -- three of those stop the entire fleet
+    # (P1). Failing here instead makes a typo a boot error on one deployment, which is
+    # both louder and cheaper. Covers --dry-run too, deliberately: a dry run whose
+    # catalogue would not boot is not a useful dry run.
+    #
+    # `RuntimeError` only, which is every failure `catalogue` raises on purpose: an
+    # empty or malformed setting, and a rung that disagrees with Nova. Anything else --
+    # girder not importable, keystone refusing the credential -- keeps its traceback,
+    # because for those the cause matters more than the message and a one-line exit
+    # would hide it.
+    try:
+        controller.load_catalogue()
+    except RuntimeError as exc:
+        sys.exit(f"worker size catalogue unusable: {exc}")
 
     if args.dry_run:
         # Deliberately reuses gather() + decide() so a dry run exercises the same code

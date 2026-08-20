@@ -144,7 +144,10 @@ class _Conn:
         return _Server("image-id", [])
 
     def find_flavor(self, name, ignore_missing=True):
-        return _Server("flavor-id", [])
+        # Echoes the requested name into the id, so a test can pin WHICH flavour was
+        # asked for. A fixed id made the one line that boots the right shape
+        # unobservable: swapping `want_flavor` back to `cfg.flavor` passed the suite.
+        return _Server(f"flavor-{name}", [])
 
     def find_network(self, name, ignore_missing=True):
         return _Server("net-id", [])
@@ -266,3 +269,119 @@ def test_the_limit_still_applies_to_the_compressed_size():
     script = base64.b64encode(os.urandom(80_000)).decode()
     with pytest.raises(RuntimeError, match="gzipped"):
         fleet.create_instance(conn, cfg, script)
+
+
+# --- sizes (P3) ------------------------------------------------------------
+
+
+@pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
+def test_the_size_is_not_injected_unless_asked():
+    """Same shared-template reasoning as WORKER_QUEUES: default must change nothing."""
+    injected = _build().split("# ---- injected")[1].split("\n\n")[0]
+    assert "SIVACOR_WORKER_SIZE" not in injected
+
+
+@pytest.mark.skipif(not TEMPLATE.is_file(), reason="deploy-sivacor not checked out")
+def test_the_size_is_injected_when_given():
+    assert "SIVACOR_WORKER_SIZE=60" in _build(worker_size=60)
+
+
+def srv(sid, tags=(), flavor_name=None, status="ACTIVE"):
+    """A detailed-listing server, with the flavour shaped the way Nova returns it."""
+    return SimpleNamespace(
+        id=sid,
+        name=f"sivacor-worker-{sid}",
+        status=status,
+        created_at="2026-08-20T13:00:00Z",
+        tags=list(tags),
+        flavor=SimpleNamespace(original_name=flavor_name) if flavor_name else None,
+    )
+
+
+def listing(*servers):
+    return SimpleNamespace(compute=SimpleNamespace(servers=lambda details: servers))
+
+
+OWNED = (fleet.FLEET_TAG, fleet.deployment_tag("test.sivacor.org"))
+
+
+def test_the_size_tag_is_what_list_fleet_reads():
+    conn = listing(srv("a", tags=(*OWNED, fleet.size_tag(60))))
+    (inst,) = fleet.list_fleet(conn, "test.sivacor.org")
+    assert inst.size == 60
+
+
+def test_the_flavour_name_is_the_fallback_for_an_untagged_instance():
+    """Costs nothing -- servers(details=True) already returns it and list_fleet used to
+    throw it away -- and covers the instance booted before the tag existed."""
+    conn = listing(srv("a", tags=OWNED, flavor_name="m3.large"))
+    (inst,) = fleet.list_fleet(conn, "test.sivacor.org", {"m3.large": 60})
+    assert inst.size == 60
+
+
+def test_an_instance_with_neither_has_no_size():
+    """A legitimate answer; plan._instance_rung resolves it to the cheapest rung."""
+    conn = listing(srv("a", tags=OWNED))
+    (inst,) = fleet.list_fleet(conn, "test.sivacor.org", {"m3.large": 60})
+    assert inst.size is None
+
+
+def test_the_size_tag_wins_over_the_flavour_name():
+    """The tag is what the controller *decided*; the flavour is only corroboration."""
+    conn = listing(srv("a", tags=(*OWNED, fleet.size_tag(30)), flavor_name="m3.large"))
+    (inst,) = fleet.list_fleet(conn, "test.sivacor.org", {"m3.large": 60})
+    assert inst.size == 30
+
+
+def test_an_unparseable_size_tag_does_not_break_the_listing():
+    """A listing that raises is a round that neither scales nor reaps."""
+    conn = listing(srv("a", tags=(*OWNED, "sivacor-size:enormous")))
+    (inst,) = fleet.list_fleet(conn, "test.sivacor.org")
+    assert inst.size is None
+
+
+def test_a_third_tag_does_not_disturb_the_deployment_filter():
+    """list_fleet filters on tag SUBSET, which is why adding a tag is safe -- an
+    instance predating this carries two tags and is matched exactly as before."""
+    conn = listing(
+        srv("mine", tags=(*OWNED, fleet.size_tag(30))),
+        srv("theirs", tags=(fleet.FLEET_TAG, fleet.deployment_tag("sivacor.org"))),
+    )
+    assert [i.id for i in fleet.list_fleet(conn, "test.sivacor.org")] == ["mine"]
+
+
+def _size_cfg():
+    return SimpleNamespace(
+        deployment="test.sivacor.org",
+        image="img",
+        flavor="m3.medium",
+        network="net",
+        key_name=None,
+        security_groups=[],
+    )
+
+
+def test_a_sized_create_is_tagged_with_its_rung():
+    """The tag is how list_fleet reads the size back without a flavour lookup."""
+    conn = _Conn()
+    fleet.create_instance(
+        conn, _size_cfg(), "#!/bin/bash\n", flavor="m3.large", size=60
+    )
+    created = conn.created[0]
+    assert fleet.size_tag(60) in created["tags"]
+    assert fleet.FLEET_TAG in created["tags"] and OURS in created["tags"]
+    assert created["metadata"]["sivacor_size_gb"] == "60"
+    assert created["metadata"]["sivacor_flavor"] == "m3.large"
+    # The assertion that matters: this is the line that boots the right hardware.
+    assert created["flavor_id"] == "flavor-m3.large", "cfg.flavor must not win here"
+
+
+def test_an_unsized_create_carries_no_size_tag_and_the_configured_flavour():
+    """The pre-P3 path, unchanged: SIVACOR_OS_FLAVOR and two tags."""
+    conn = _Conn()
+    fleet.create_instance(conn, _size_cfg(), "#!/bin/bash\n")
+    created = conn.created[0]
+    assert not any(t.startswith(fleet.SIZE_TAG_PREFIX) for t in created["tags"])
+    assert "sivacor_size_gb" not in created["metadata"]
+    assert created["metadata"]["sivacor_flavor"] == "m3.medium"
+    assert created["flavor_id"] == "flavor-m3.medium"
