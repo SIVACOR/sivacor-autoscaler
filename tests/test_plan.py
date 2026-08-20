@@ -828,9 +828,9 @@ def test_nothing_of_ours_to_place_does_not_read_as_a_stall():
 # tests above are what assert that.
 # ---------------------------------------------------------------------------
 
-#: The catalogue as P3 ships it: the 30 rung is what every deployment already boots
-#: (`SIVACOR_OS_FLAVOR` defaults to `m3.medium`, measured on the mirror 2026-08-20),
-#: so the smallest -- hence the default -- is also the status quo.
+#: Two rungs from the real Jetstream2 ladder, verified against live Nova 2026-08-20
+#: (m3.medium 8 vCPU / 30720 MiB, m3.large 16 vCPU / 61440 MiB). Which rung a given
+#: deployment defaults to is its own configuration and not this function's business.
 LADDER = (SizeSpec(memory_gb=30, vcpus=8), SizeSpec(memory_gb=60, vcpus=16))
 SIZED = Limits(max_instances=5, assign=True, sizes=LADDER)
 

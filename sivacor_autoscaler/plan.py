@@ -102,11 +102,12 @@ class WaitingSubmission:
     #: Advertised RAM the submission asked for, per ``meta.requested_memory_gb``.
     #:
     #: ``None`` means the submission predates P1's recording of it. Treated as the
-    #: smallest catalogue rung -- the cheapest shape, and the one a pre-P1 submission
-    #: actually ran on, since every deployment booted ``SIVACOR_OS_FLAVOR``'s default
-    #: ``m3.medium`` (measured on the mirror 2026-08-20: ``MemTotal`` 29.37 GiB,
-    #: 8 vCPU). Defaulting *up* would silently double the SU cost of the oldest
-    #: submissions in the queue, which is the direction nobody would notice.
+    #: smallest catalogue rung, because that is the cheap direction: defaulting *up*
+    #: silently multiplies the SU cost of the oldest submissions in the queue, and
+    #: nobody reviews a bill for instances that all ran successfully. It is also only
+    #: ever a guess -- what such a submission really ran on is whatever
+    #: ``SIVACOR_OS_FLAVOR`` said at the time, which differs per deployment, so there is
+    #: no right answer to recover here, only a safe one.
     memory_gb: int | None = None
 
     #: Whether this submission is *ours* to place, per ``meta.awaiting_assignment``.
