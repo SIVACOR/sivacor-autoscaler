@@ -15,6 +15,15 @@ there are no rungs at all, so it boots nothing and every submission waits while 
 numbers read healthy. That is exactly the trap P2's preflight found on the mirror,
 where ``sivacor.worker_sizes`` has no document.
 
+**But the model layer only helps if the default has been registered, and that took a
+crash-loop to learn (mirror, 2026-08-20).** ``SettingDefault.defaults`` is not something
+Girder knows a priori -- it is populated when ``girder_sivacor.settings`` is *imported*.
+The Girder server imports it via ``SIVACORPlugin.load()``; this process has no plugin
+load, so nothing imports it unless :func:`load` does. Reading through the model layer
+with the owning module unimported gets the *worst* of both: the appearance of a default
+and the behaviour of a raw read. See the imports in :func:`load`, which are both
+mandatory for that reason.
+
 This is why :func:`signals.targeted_assignment` may read raw and this may not: a boolean
 whose default is ``False`` means "absent" and "off" are the same document, so nothing is
 lost. A non-empty catalogue has no such luck.
@@ -22,6 +31,13 @@ lost. A non-empty catalogue has no such luck.
 Girder is imported lazily, inside the function that needs it, so :mod:`plan` and
 :mod:`signals` stay testable in a bare virtualenv -- the same split :mod:`dispatch`
 keeps.
+
+**Why this module has no setting-key constant of its own while :mod:`signals` does.**
+``signals.TARGETED_ASSIGNMENT_KEY`` is a hand-copied string with a "must match" comment,
+and that is correct *there*: that module reads Mongo directly and must import nothing
+from Girder, so it has no way to reference the real constant. Here the girder import is
+already mandatory -- see :func:`load` -- so the key comes from ``PluginSettings`` and no
+second copy exists to drift. Do not "tidy" a literal back in.
 """
 
 from __future__ import annotations
@@ -32,10 +48,6 @@ from dataclasses import dataclass
 from .plan import SizeSpec
 
 logger = logging.getLogger(__name__)
-
-#: Girder's key for the catalogue. Must match
-#: ``girder_sivacor.settings.PluginSettings.WORKER_SIZES``.
-WORKER_SIZES_KEY = "sivacor.worker_sizes"
 
 #: Nova advertises RAM in MiB, and the ``m3`` figures are exact binary -- verified live
 #: 2026-08-20: 30 GiB = 30720, 60 = 61440, 125 = 128000, 250 = 256000. So the check in
@@ -77,14 +89,29 @@ def load(strict: bool = True) -> tuple[Rung, ...]:
     arithmetic would be wrong, and the controller refusing to start is far louder than a
     fleet that boots the wrong shapes.
     """
+    # **Both imports are required, and the second one is not for the constant.**
+    # `Setting().get()` falls back to `SettingDefault.defaults`, but that dict is
+    # populated as an *import side effect* of `girder_sivacor.settings` -- in the Girder
+    # server `SIVACORPlugin.load()` causes that import, and in this process nothing
+    # does. Import only `girder.models.setting` and the fallback silently is not there:
+    # on a deployment that never wrote the setting, `get()` returns None and the fleet
+    # believes there are no rungs at all.
+    #
+    # That is not hypothetical -- it crash-looped the mirror's controller on 2026-08-20,
+    # and it is why this module reads the key from `PluginSettings` rather than keeping
+    # its own copy of the string. Importing the module that owns the default is the
+    # thing that makes the default exist; taking the constant from it too means the
+    # import cannot be mistaken for unused and dropped by a tidy-up.
     from girder.models.setting import Setting
+    from girder_sivacor.settings import PluginSettings
 
-    raw = Setting().get(WORKER_SIZES_KEY)
+    key = PluginSettings.WORKER_SIZES
+    raw = Setting().get(key)
     if not raw:
         # Reachable only if girder_sivacor's SettingDefault is gone too, which means the
         # image is not the one this controller is supposed to be running on.
         raise RuntimeError(
-            f"{WORKER_SIZES_KEY} is empty even through Girder's model layer, which "
+            f"{key} is empty even through Girder's model layer, which "
             "applies the plugin's own default. Is girder_sivacor installed in this "
             "image? See P0.5 -- the controller and Girder share one build."
         )
@@ -101,16 +128,16 @@ def load(strict: bool = True) -> tuple[Rung, ...]:
         except (KeyError, TypeError, ValueError) as exc:
             if strict:
                 raise RuntimeError(
-                    f"malformed entry in {WORKER_SIZES_KEY}: {entry!r} ({exc}). "
+                    f"malformed entry in {key}: {entry!r} ({exc}). "
                     "Girder validates this setting on write, so a bad entry here means "
                     "it was written straight into Mongo, bypassing the validator."
                 ) from exc
-            logger.warning("dropping malformed %s entry %r", WORKER_SIZES_KEY, entry)
+            logger.warning("dropping malformed %s entry %r", key, entry)
             continue
         out.append(rung)
 
     if not out:
-        raise RuntimeError(f"{WORKER_SIZES_KEY} has no usable entries")
+        raise RuntimeError(f"{key} has no usable entries")
     # Smallest first, so "the default rung" and "the cheapest rung" are the same lookup
     # everywhere and no caller has to remember to sort.
     return tuple(sorted(out, key=lambda r: r.memory_gb))
@@ -186,8 +213,8 @@ def validate(conn, rungs) -> None:
         raise RuntimeError(
             "worker size catalogue disagrees with Nova:\n  "
             + "\n  ".join(problems)
-            + f"\nFix {WORKER_SIZES_KEY} in Girder (through the REST API, so the "
-            "validator runs) and redeploy."
+            + "\nFix the worker-size catalogue in Girder -- through the REST API, so "
+            "the validator runs -- and restart this service, which reads it at startup."
         )
     logger.info(
         "worker sizes validated against Nova: %s",

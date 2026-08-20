@@ -24,22 +24,60 @@ LADDER = [
 
 @pytest.fixture
 def girder_setting(monkeypatch):
-    """Stub `girder.models.setting.Setting` so `load()` can run without Girder.
+    """Stub Girder so `load()` can run in a bare virtualenv -- **including the coupling
+    that crash-looped the mirror.**
 
-    `catalogue.load` imports it lazily and by module path, which is what keeps `plan`
-    and `signals` testable in a bare virtualenv -- so the stub has to be installed in
-    `sys.modules` rather than monkeypatched onto an attribute.
+    `catalogue.load` imports both modules lazily and by module path, which is what keeps
+    `plan` and `signals` dependency-free, so the stubs go into `sys.modules`.
+
+    What makes this stub worth reading: **the plugin default only exists once
+    `girder_sivacor.settings` has been touched.** In reality that module registers it as
+    an import side effect (`SettingDefault.defaults.update(...)` at module level); the
+    Girder server triggers that via `SIVACORPlugin.load()` and this process triggers it
+    from nowhere at all. So a `load()` that reads the setting through the model layer but
+    never imports the module that owns the default gets the worst of both worlds -- the
+    appearance of a fallback and the behaviour of a raw Mongo read -- and returns None on
+    any deployment that never wrote the setting. That is what took the mirror's
+    controller down on 2026-08-20.
+
+    Here that is modelled with PEP 562 module `__getattr__`: the default lands in
+    `defaults` only when something actually reads `PluginSettings` off the module. A stub
+    that just returned a value, as the first version of this fixture did, passes happily
+    either way -- which is exactly why the bug shipped.
     """
 
-    def install(value):
-        mod = ModuleType("girder.models.setting")
-        mod.Setting = lambda: SimpleNamespace(get=lambda key: value)
-        pkg = ModuleType("girder")
-        models = ModuleType("girder.models")
-        monkeypatch.setitem(sys.modules, "girder", pkg)
-        monkeypatch.setitem(sys.modules, "girder.models", models)
-        monkeypatch.setitem(sys.modules, "girder.models.setting", mod)
-        return mod
+    def install(stored, *, plugin_default=None):
+        defaults = {}
+
+        class Setting:
+            def get(self, key):
+                if stored is not None:
+                    return stored
+                # Girder's real behaviour: no document -> SettingDefault.defaults.
+                return defaults.get(key)
+
+        setting_mod = ModuleType("girder.models.setting")
+        setting_mod.Setting = Setting
+        monkeypatch.setitem(sys.modules, "girder", ModuleType("girder"))
+        monkeypatch.setitem(sys.modules, "girder.models", ModuleType("girder.models"))
+        monkeypatch.setitem(sys.modules, "girder.models.setting", setting_mod)
+
+        class PluginSettings:
+            WORKER_SIZES = "sivacor.worker_sizes"
+
+        plugin_mod = ModuleType("girder_sivacor.settings")
+
+        def __getattr__(name):
+            if name != "PluginSettings":
+                raise AttributeError(name)
+            if plugin_default is not None:
+                defaults["sivacor.worker_sizes"] = plugin_default
+            return PluginSettings
+
+        plugin_mod.__getattr__ = __getattr__
+        monkeypatch.setitem(sys.modules, "girder_sivacor", ModuleType("girder_sivacor"))
+        monkeypatch.setitem(sys.modules, "girder_sivacor.settings", plugin_mod)
+        return plugin_mod
 
     return install
 
@@ -90,6 +128,32 @@ def test_an_absent_setting_is_a_hard_error_not_an_empty_fleet(girder_setting):
     girder_setting(None)
     with pytest.raises(RuntimeError, match="girder_sivacor"):
         catalogue.load()
+
+
+def test_the_plugin_default_covers_a_deployment_that_never_wrote_the_setting(girder_setting):
+    """THE regression. The mirror's controller crash-looped on this, 2026-08-20.
+
+    No setting document -- which is the mirror's actual state, and what P2's preflight
+    found -- so the whole claim that "reading through the model layer closes the
+    absent-document trap" rests on `SettingDefault` having the plugin's default in it.
+    It only does if `girder_sivacor.settings` has been imported, and in this process the
+    only thing that can cause that import is `load()` itself.
+
+    Drop `from girder_sivacor.settings import PluginSettings` from `load()` and this
+    test fails with the exact error the mirror produced.
+    """
+    girder_setting(None, plugin_default=LADDER)
+
+    rungs = catalogue.load()
+
+    assert [r.memory_gb for r in rungs] == [30, 60]
+    assert [r.flavor for r in rungs] == ["m3.medium", "m3.large"]
+
+
+def test_a_written_setting_wins_over_the_plugin_default(girder_setting):
+    """The ordinary case, and the one the mirror will be in once P3 is configured."""
+    girder_setting([LADDER[1]], plugin_default=LADDER)
+    assert [r.memory_gb for r in catalogue.load()] == [60]
 
 
 def test_a_malformed_entry_refuses_to_start(girder_setting):
