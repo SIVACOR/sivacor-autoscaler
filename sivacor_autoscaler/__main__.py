@@ -201,7 +201,32 @@ def main() -> int:
             cfg.limits.max_lifetime,
         )
 
-    # Fourth of the same family, and the one that fails latest if left unsaid. Once
+    # Fifth of the same family, added because its absence was noticed the hard way:
+    # `SIVACOR_MAX_VCPUS=8` was confirmed present only by `docker exec ... env`, because
+    # nothing announced it and the quota stop is by design a line that fires rarely. A
+    # guardrail whose configured value never reaches the log is one nobody can confirm
+    # took effect until it bites -- and for this one "it bit" looks like a submission
+    # waiting, which is the state S7 says must never be silent.
+    if cfg.limits.max_vcpus or cfg.limits.max_ram_gb:
+        logging.getLogger(__name__).info(
+            "quota headroom: max_instances=%s, max_vcpus=%s, max_ram_gb=%s (S6). "
+            "Whichever binds first stops creation, oldest submission first",
+            cfg.limits.max_instances,
+            cfg.limits.max_vcpus if cfg.limits.max_vcpus else "off",
+            cfg.limits.max_ram_gb if cfg.limits.max_ram_gb else "off",
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "quota headroom is the instance count alone (max_instances=%s); "
+            "SIVACOR_MAX_VCPUS and SIVACOR_MAX_RAM_GB are unset. Correct while every "
+            "worker is one shape -- the count binds at the bottom rung and only there "
+            "-- but it stops bounding cost once sizes differ: at 125 GiB the RAM quota "
+            "binds at nine instances, not %s (S6, superseding D3)",
+            cfg.limits.max_instances,
+            cfg.limits.max_instances,
+        )
+
+    # Sixth of the same family, and the one that fails latest if left unsaid. Once
     # targeted assignment is armed -- which is a Girder setting, not an environment
     # variable, so it can happen without a redeploy and without this process
     # restarting -- the controller publishes celery chains itself. Without a broker it

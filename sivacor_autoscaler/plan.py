@@ -647,7 +647,9 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         # idle 30 GB instance is a shortfall of two, not one.
         wanted = _wanted_rungs(state, limits, available, stalled)
         shortfall = len(wanted)
-        create_sizes = _allocate(wanted, live, limits, headroom, reasons, alerts)
+        create_sizes, stopped_by = _allocate(
+            wanted, live, limits, headroom, reasons, alerts
+        )
     else:
         # Unarmed, or no catalogue: size information is absent end to end. Nothing is
         # placed by this controller, and every instance is the one shape
@@ -660,6 +662,8 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         # order itself.
         shortfall = demand - len(available)
         create_sizes = (None,) * max(0, min(shortfall, headroom))
+        # The scalar path can only ever be capped by the instance count.
+        stopped_by = "instances" if len(create_sizes) < shortfall else None
     create = len(create_sizes)
     spent_live = len([i for i in live if i.id in state.spent])
     # Surfaced only when non-zero: on a healthy fleet it is noise on every tick, and
@@ -682,13 +686,22 @@ def decide(state: FleetState, limits: Limits) -> Decision:
             f"{len(available)} available of {len(live)} live ({spent_live} spent{dead}, "
             f"serving={state.serving})"
         )
-    elif create < shortfall:
+    elif create < shortfall and stopped_by == "instances":
         # Not an error: the queue simply waits. Logged loudly because a cap that
         # silently throttles looks identical to a controller that has stopped working.
         reasons.append(
             f"CAPPED: want {shortfall} more but only {headroom} slot(s) left of "
             f"max_instances={limits.max_instances}; {shortfall - create} submission(s) "
             "will wait"
+        )
+    elif create < shortfall:
+        # Something else stopped the allocation and has already said so in its own
+        # words -- the quota, or a rung that left the catalogue. Naming max_instances
+        # here as well would point the operator at a limit that is not binding.
+        reasons.append(
+            f"{shortfall - create} submission(s) will wait: see the head-of-line line "
+            f"above ({headroom} of {limits.max_instances} instance slot(s) still free, "
+            "so the instance cap is not what bound)"
         )
     else:
         reasons.append(
@@ -794,7 +807,7 @@ def _wanted_rungs(state, limits, available, stalled) -> list[int | None]:
     return out
 
 
-def _allocate(wanted, live, limits, headroom, reasons, alerts) -> tuple[int | None, ...]:
+def _allocate(wanted, live, limits, headroom, reasons, alerts):
     """Turn wanted rungs into creates, oldest first, stopping at the first that will not
     fit (S7).
 
@@ -802,17 +815,20 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts) -> tuple[int | No
     raises utilisation and starves the large sizes forever, because the expensive
     submission is always the one that does not fit. See S7.
 
-    The instance cap is left to the caller's ``CAPPED`` line rather than logged here --
-    it is the ordinary busy-fleet reading and already has a message that names the cap.
-    A *quota* stop is different: it is the failure D3's instance-only rule left the door
-    open for, and a submission waiting behind a quota it cannot name is the least
-    debuggable state this design can produce.
+    Returns ``(rungs, stopped_by)`` where ``stopped_by`` is ``None``, ``"instances"``,
+    ``"quota"`` or ``"catalogue"``. **The caller needs that to describe the cap
+    correctly**, and getting it wrong is not cosmetic: observed on the mirror
+    2026-08-20, a quota stop was reported as ``CAPPED: want 2 more but only 3 slot(s)
+    left of max_instances=5``, which reads as "raise max_instances" when raising it
+    would change nothing. A submission waiting behind a quota it cannot name is the
+    least debuggable state this design can produce (S7); one waiting behind a quota
+    that names the *wrong* limit is worse, because it sends the operator somewhere.
     """
     used_v, used_r = _quota_used(live, limits)
     out: list[int | None] = []
     for rung in wanted:
         if len(out) >= headroom:
-            break
+            return tuple(out), "instances"
         spec = _spec(limits, rung)
         if spec is None and rung is not None:
             line = (
@@ -824,7 +840,7 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts) -> tuple[int | No
             )
             reasons.append(line)
             alerts.append(line)
-            break
+            return tuple(out), "catalogue"
         need_v = spec.vcpus if spec else 0
         need_r = spec.memory_gb if spec else 0
         over = []
@@ -842,11 +858,11 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts) -> tuple[int | No
             )
             reasons.append(line)
             alerts.append(line)
-            break
+            return tuple(out), "quota"
         out.append(rung)
         used_v += need_v
         used_r += need_r
-    return tuple(out)
+    return tuple(out), None
 
 
 def _oldest_first(waiting) -> tuple[WaitingSubmission, ...]:

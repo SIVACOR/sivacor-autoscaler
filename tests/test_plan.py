@@ -1029,3 +1029,43 @@ def test_unarmed_creates_are_unsized():
     """Demand from queue depth carries no size, so the caller boots its own default."""
     d = decide(state(depth=2), Limits(max_instances=5, sizes=LADDER))
     assert d.create == (None, None)
+
+
+def test_a_quota_stop_does_not_blame_the_instance_cap():
+    """The mirror's log, 2026-08-20, reduced to an assertion.
+
+    Two workers left over from an earlier test (8 + 16 = 24 vCPU) against a max_vcpus of
+    8, with instance slots to spare. The fleet is genuinely over quota, so nothing can be
+    created -- but the old code reported it as `CAPPED: want 2 more but only 3 slot(s)
+    left of max_instances=5`, which reads as "raise max_instances" when raising it would
+    change nothing.
+
+    Counting spent-but-live instances is correct here and not the bug: a spent instance
+    really does hold its vCPU against the allocation until it is reaped.
+    """
+    limits = Limits(max_instances=5, assign=True, sizes=LADDER, max_vcpus=8)
+    d = decide(
+        state(
+            instances=[inst("small", size=30), inst("big", size=60)],
+            spent=["small", "big"],
+            waiting=waiting(MIN * 4, MIN * 3, sizes=[30, 30]),
+        ),
+        limits,
+    )
+
+    assert d.create == (), "24 vCPU are already held; nothing fits"
+    assert any("does not fit the quota" in a for a in d.alerts)
+    assert any("vCPU 24+8 > 8" in a for a in d.alerts), "name the real arithmetic"
+    # The point of the fix:
+    assert not any("CAPPED" in r for r in d.reasons), "the instance cap did not bind"
+    assert any("instance cap is not what bound" in r for r in d.reasons)
+
+
+def test_the_instance_cap_still_says_CAPPED_when_it_is_what_bound():
+    """The other half: don't lose the message that has been there since D3."""
+    limits = Limits(max_instances=2, assign=True, sizes=LADDER)
+    d = decide(
+        state(waiting=waiting(*[MIN * 5] * 5, sizes=[30] * 5)), limits
+    )
+    assert len(d.create) == 2
+    assert any("CAPPED" in r and "max_instances=2" in r for r in d.reasons)
