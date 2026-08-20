@@ -5,6 +5,7 @@ submissions in the other, so the cases below are the ones worth being sure about
 rather than a sweep for coverage.
 """
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sivacor_autoscaler.plan import (
@@ -12,16 +13,22 @@ from sivacor_autoscaler.plan import (
     FleetState,
     Instance,
     Limits,
+    SizeSpec,
     WaitingSubmission,
     decide,
 )
 
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+#: Shorthand for the P3 cases below, where what matters about an age is only that it
+#: is comfortably past `unclaimed_grace` and orders predictably against its siblings.
+MIN = timedelta(minutes=1)
 LIMITS = Limits(max_instances=5, max_lifetime=timedelta(hours=30), breaker_threshold=3)
 
 
-def inst(name, status="ACTIVE", age=timedelta(minutes=5)):
-    return Instance(id=f"id-{name}", name=name, status=status, created_at=NOW - age)
+def inst(name, status="ACTIVE", age=timedelta(minutes=5), size=None):
+    return Instance(
+        id=f"id-{name}", name=name, status=status, created_at=NOW - age, size=size
+    )
 
 
 def state(
@@ -55,16 +62,21 @@ def state(
     )
 
 
-def waiting(*ages, ids=None, assignable=True):
+def waiting(*ages, ids=None, assignable=True, sizes=None):
     """Waiting submissions, named ``sub-0``, ``sub-1``, ... unless ``ids`` says otherwise.
 
     ``assignable=False`` is the mixed-mode submission: dispatched to the shared queue
     by ``submit_job`` before assignment was armed, so it is demand but not ours.
+
+    ``sizes`` gives each submission a ``memory_gb``, positionally. Omitted leaves them
+    all ``None``, which is every test written before P3 -- and, per
+    ``WaitingSubmission.memory_gb``, resolves to the smallest catalogue rung.
     """
     names = ids or [f"sub-{i}" for i in range(len(ages))]
+    mems = list(sizes or ()) + [None] * (len(ages) - len(sizes or ()))
     return tuple(
-        WaitingSubmission(id=n, age=a, assignable=assignable)
-        for n, a in zip(names, ages)
+        WaitingSubmission(id=n, age=a, assignable=assignable, memory_gb=m)
+        for n, a, m in zip(names, ages, mems)
     )
 
 
@@ -75,12 +87,12 @@ D9 = Limits(provision_deadline=timedelta(minutes=10))
 
 def test_scale_from_zero():
     d = decide(state(depth=3), LIMITS)
-    assert d.create == 3
+    assert len(d.create) == 3
 
 
 def test_nothing_queued_nothing_created():
     d = decide(state(depth=0, instances=[inst("w1")]), LIMITS)
-    assert d == Decision(create=0, delete=(), reasons=d.reasons)
+    assert d == Decision(create=(), delete=(), reasons=d.reasons)
     assert any("no new instances" in r for r in d.reasons)
 
 
@@ -100,7 +112,7 @@ def test_spent_instances_do_not_absorb_the_queue():
         LIMITS,
     )
 
-    assert d.create == 1, "a queued submission with only spent workers must scale up"
+    assert len(d.create) == 1, "a queued submission with only spent workers must scale up"
 
 
 def test_finished_but_not_yet_powered_off_does_not_block_creation():
@@ -117,7 +129,7 @@ def test_finished_but_not_yet_powered_off_does_not_block_creation():
         state(depth=1, serving=0, instances=[spent_and_idle], spent=["w1"]), LIMITS
     )
 
-    assert d.create == 1, "a spent-but-alive worker must not count as capacity"
+    assert len(d.create) == 1, "a spent-but-alive worker must not count as capacity"
     assert any("1 spent" in r for r in d.reasons)
 
 
@@ -125,7 +137,7 @@ def test_available_instances_are_not_double_counted():
     """The other direction: an idle worker that has claimed nothing will take the work."""
     d = decide(state(depth=1, instances=[inst("w1")]), LIMITS)
 
-    assert d.create == 0
+    assert len(d.create) == 0
     assert any("1 available" in r for r in d.reasons)
 
 
@@ -134,7 +146,7 @@ def test_booting_instances_are_not_double_counted():
     d = decide(
         state(depth=2, serving=0, instances=[inst("w1", status="BUILD")]), LIMITS
     )
-    assert d.create == 1
+    assert len(d.create) == 1
 
 
 def test_cap_is_respected_and_says_so():
@@ -143,7 +155,7 @@ def test_cap_is_respected_and_says_so():
     spent = [f"w{i}" for i in range(5)]
     d = decide(state(depth=4, serving=5, instances=live, spent=spent), LIMITS)
 
-    assert d.create == 0
+    assert len(d.create) == 0
     assert any("CAPPED" in r for r in d.reasons)
     assert any("will wait" in r for r in d.reasons)
 
@@ -152,7 +164,7 @@ def test_partial_cap_creates_what_it_can():
     live = [inst(f"w{i}") for i in range(4)]
     spent = [f"w{i}" for i in range(4)]
     d = decide(state(depth=3, serving=4, instances=live, spent=spent), LIMITS)
-    assert d.create == 1  # one slot left of five
+    assert len(d.create) == 1  # one slot left of five
 
 
 def test_shutoff_instances_are_reaped():
@@ -165,7 +177,7 @@ def test_shutoff_instances_do_not_count_against_the_cap():
     """They hold no work; counting them would throttle the fleet as they accumulate."""
     dead = [inst(f"d{i}", status="SHUTOFF") for i in range(5)]
     d = decide(state(depth=2, instances=dead), LIMITS)
-    assert d.create == 2
+    assert len(d.create) == 2
     assert len(d.delete) == 5
 
 
@@ -183,7 +195,7 @@ def test_instance_under_max_lifetime_survives():
 
 def test_breaker_stops_creation():
     d = decide(state(depth=5, failures=3), LIMITS)
-    assert d.create == 0
+    assert len(d.create) == 0
     assert any("BREAKER OPEN" in r for r in d.reasons)
 
 
@@ -197,13 +209,13 @@ def test_breaker_does_not_stop_reaping():
     d = decide(
         state(depth=5, failures=9, instances=[inst("dead", status="SHUTOFF")]), LIMITS
     )
-    assert d.create == 0
+    assert len(d.create) == 0
     assert d.delete == ("id-dead",)
 
 
 def test_breaker_just_below_threshold_still_creates():
     d = decide(state(depth=1, failures=2), LIMITS)
-    assert d.create == 1
+    assert len(d.create) == 1
 
 
 def test_naive_timestamps_do_not_raise():
@@ -260,7 +272,7 @@ def test_unprovisioned_instance_is_reaped_and_not_counted_as_capacity():
     assert d.delete == ("id-dead",)
     # ...and a replacement is created in the same round, because the corpse no longer
     # absorbs the shortfall. Both halves matter: reaping alone would still stall.
-    assert d.create == 1
+    assert len(d.create) == 1
     assert any("no readiness marker" in r for r in d.reasons)
 
 
@@ -269,7 +281,7 @@ def test_ready_instance_is_normal_capacity():
     d = decide(state(depth=1, instances=[ready], ready=["ready"]), D9)
 
     assert d.delete == ()
-    assert d.create == 0
+    assert len(d.create) == 0
 
 
 def test_instance_inside_the_deadline_is_left_alone():
@@ -278,7 +290,7 @@ def test_instance_inside_the_deadline_is_left_alone():
     d = decide(state(depth=1, instances=[booting]), D9)
 
     assert d.delete == ()
-    assert d.create == 0
+    assert len(d.create) == 0
 
 
 def test_spent_instance_is_never_written_off_even_without_a_marker():
@@ -338,7 +350,7 @@ def test_unclaimed_submission_scales_up_when_depth_lost_it():
               unclaimed_ages=[STALE]),
         LIMITS,
     )
-    assert d.create == 1, (
+    assert len(d.create) == 1, (
         "a submission unclaimed for minutes must scale up even at depth=0: its "
         "message is reserved by a worker that cannot start it"
     )
@@ -355,20 +367,20 @@ def test_unclaimed_alert_is_also_a_reason():
 def test_unclaimed_within_grace_is_ignored():
     """The gap between reserving a message and calling claim() is normal."""
     d = decide(state(depth=0, unclaimed_ages=[FRESH]), LIMITS)
-    assert d.create == 0
+    assert len(d.create) == 0
     assert not d.alerts
 
 
 def test_unclaimed_is_not_added_to_depth():
     """A queued submission is *also* unclaimed; counting both provisions twice."""
     d = decide(state(depth=1, unclaimed_ages=[STALE]), LIMITS)
-    assert d.create == 1, "max(depth, unclaimed), never depth + unclaimed"
+    assert len(d.create) == 1, "max(depth, unclaimed), never depth + unclaimed"
     assert not d.alerts, "depth already accounts for it, so nothing is anomalous"
 
 
 def test_unclaimed_does_not_double_provision_against_available_capacity():
     d = decide(state(depth=0, instances=[inst("w1")], unclaimed_ages=[STALE]), LIMITS)
-    assert d.create == 0, "an idle available worker will take it; no new instance"
+    assert len(d.create) == 0, "an idle available worker will take it; no new instance"
 
 
 def test_unclaimed_respects_the_breaker():
@@ -376,12 +388,12 @@ def test_unclaimed_respects_the_breaker():
         state(depth=0, unclaimed_ages=[STALE, STALE], failures=3),
         LIMITS,
     )
-    assert d.create == 0, "a tripped breaker must not be bypassed by a new signal"
+    assert len(d.create) == 0, "a tripped breaker must not be bypassed by a new signal"
 
 
 def test_unclaimed_absent_keeps_old_behaviour():
     d = decide(state(depth=2), LIMITS)
-    assert d.create == 2
+    assert len(d.create) == 2
     assert not d.alerts
 
 
@@ -474,7 +486,7 @@ def test_an_instance_that_has_not_registered_is_never_assigned():
     d = decide(state(waiting=waiting(OLDEST), instances=[inst("booting")]), ASSIGN)
 
     assert d.assign == ()
-    assert d.create == 0
+    assert len(d.create) == 0
     assert any("none assignable" in r for r in d.reasons)
 
 
@@ -491,7 +503,7 @@ def test_an_instance_that_already_holds_a_submission_is_not_assigned_another():
     )
 
     assert d.assign == ()
-    assert d.create == 1, "a spent instance is not capacity for a waiting submission"
+    assert len(d.create) == 1, "a spent instance is not capacity for a waiting submission"
 
 
 def test_an_instance_being_reaped_this_round_is_not_assigned():
@@ -521,7 +533,7 @@ def test_an_instance_past_the_assign_ceiling_is_neither_assigned_nor_capacity():
     d = decide(state(waiting=waiting(RECENT), instances=[stale], ready=["stale"]), ASSIGN)
 
     assert d.assign == ()
-    assert d.create == 1
+    assert len(d.create) == 1
     assert any("too old to assign" in a for a in d.alerts)
 
 
@@ -587,8 +599,8 @@ def test_a_fresh_submission_is_demand_immediately_when_armed():
     """
     fresh = state(waiting=waiting(FRESH))
 
-    assert decide(fresh, LIMITS).create == 0
-    assert decide(fresh, ASSIGN).create == 1
+    assert len(decide(fresh, LIMITS).create) == 0
+    assert len(decide(fresh, ASSIGN).create) == 1
 
 
 def test_a_waiting_submission_at_depth_zero_is_not_an_anomaly_when_armed():
@@ -596,14 +608,14 @@ def test_a_waiting_submission_at_depth_zero_is_not_an_anomaly_when_armed():
     d = decide(state(depth=0, waiting=waiting(OLDEST)), ASSIGN)
 
     assert not d.alerts
-    assert d.create == 1
+    assert len(d.create) == 1
 
 
 def test_a_shared_queue_message_is_not_provisioned_for_twice():
     """Rollout step 3 runs both paths: a dispatched submission is also unassigned."""
     d = decide(state(depth=1, waiting=waiting(OLDEST)), ASSIGN)
 
-    assert d.create == 1, "max(depth, waiting), never depth + waiting"
+    assert len(d.create) == 1, "max(depth, waiting), never depth + waiting"
 
 
 def test_assignment_and_creation_are_decided_together():
@@ -615,7 +627,7 @@ def test_assignment_and_creation_are_decided_together():
     )
 
     assert len(d.assign) == 1
-    assert d.create == 2, "three waiting, one available: two more instances"
+    assert len(d.create) == 2, "three waiting, one available: two more instances"
 
 
 def test_the_breaker_does_not_block_assignment():
@@ -630,7 +642,7 @@ def test_the_breaker_does_not_block_assignment():
         ASSIGN,
     )
 
-    assert d.create == 0
+    assert len(d.create) == 0
     assert d.assign == (("sub-0", "id-w1"),)
 
 
@@ -702,7 +714,7 @@ def _simulate(n_submissions, limits=ASSIGN, ticks=40):
             assert sub not in placed, f"{sub} placed twice"
             assert inst_id not in placed.values(), f"{inst_id} given two submissions"
             placed[sub] = inst_id
-        for _ in range(d.create):
+        for _rung in d.create:
             creates += 1
             created[f"i-{creates}"] = now
         for inst_id in d.delete:
@@ -769,7 +781,7 @@ def test_a_submission_girder_dispatched_still_counts_as_demand():
     """
     d = decide(state(waiting=waiting(OLDEST, assignable=False)), ASSIGN)
 
-    assert d.create == 1
+    assert len(d.create) == 1
 
 
 def test_the_placeable_head_of_the_line_is_served_past_an_unplaceable_one():
@@ -808,3 +820,212 @@ def test_nothing_of_ours_to_place_does_not_read_as_a_stall():
 
     assert any("none of them ours to place" in r for r in d.reasons)
     assert not any("none assignable" in r for r in d.reasons)
+
+
+# ---------------------------------------------------------------------------
+# P3: a heterogeneous fleet. Everything below needs BOTH a catalogue and
+# `assign=True`; with either missing the arithmetic is the pre-P3 one, and the
+# tests above are what assert that.
+# ---------------------------------------------------------------------------
+
+#: The catalogue as P3 ships it: the 30 rung is what every deployment already boots
+#: (`SIVACOR_OS_FLAVOR` defaults to `m3.medium`, measured on the mirror 2026-08-20),
+#: so the smallest -- hence the default -- is also the status quo.
+LADDER = (SizeSpec(memory_gb=30, vcpus=8), SizeSpec(memory_gb=60, vcpus=16))
+SIZED = Limits(max_instances=5, assign=True, sizes=LADDER)
+
+
+def test_an_empty_catalogue_is_the_pre_p3_arithmetic():
+    """The equivalence the whole phase order rests on.
+
+    Production is flag-off with no catalogue, so it must take the old path exactly.
+    Same state, two limits differing only in `sizes`: identical decisions.
+    """
+    s = state(depth=0, instances=[inst("a")], ready=["a"], waiting=waiting(MIN * 3))
+    bare = decide(s, Limits(max_instances=5, assign=True))
+    assert len(bare.create) == 0
+    assert bare.assign == (("sub-0", "id-a"),)
+    # And with a catalogue, an unsized instance is the smallest rung and an unsized
+    # submission wants the smallest rung, so they still meet.
+    sized = decide(s, SIZED)
+    assert sized.assign == bare.assign
+    assert len(sized.create) == len(bare.create)
+
+
+def test_an_instance_of_the_wrong_size_is_not_capacity():
+    """Two 60 GB submissions against one idle 30 GB instance need TWO creates.
+
+    The scalar formula says one -- `demand(2) - available(1)` -- and that is the exact
+    assumption that stops being true once the fleet is heterogeneous. Getting this
+    wrong strands the second submission behind capacity that can never serve it, which
+    is the run-3/run-5 stall shape in a new dimension.
+    """
+    d = decide(
+        state(
+            instances=[inst("small", size=30)],
+            ready=["small"],
+            waiting=waiting(MIN * 4, MIN * 3, sizes=[60, 60]),
+        ),
+        SIZED,
+    )
+    assert d.create == (60, 60)
+    assert d.assign == (), "a 30 GB instance must never take a 60 GB submission"
+
+
+def test_a_submission_is_assigned_only_to_its_own_size():
+    d = decide(
+        state(
+            instances=[inst("small", size=30), inst("big", size=60)],
+            ready=["small", "big"],
+            waiting=waiting(MIN * 3, sizes=[60]),
+        ),
+        SIZED,
+    )
+    assert d.assign == (("sub-0", "id-big"),)
+
+
+def test_assignment_stops_at_the_head_of_the_line_rather_than_skipping():
+    """S7. The 60 GB submission is oldest and cannot be placed; the 30 GB one waits.
+
+    Skipping would raise utilisation and starve the large sizes forever, because under
+    a steady stream of small submissions the expensive one is always the one that does
+    not fit -- and it is unexplainable to a researcher watching later submissions run.
+    """
+    d = decide(
+        state(
+            instances=[inst("small", size=30)],
+            ready=["small"],
+            waiting=waiting(MIN * 9, MIN * 2, sizes=[60, 30]),
+        ),
+        SIZED,
+    )
+    assert d.assign == (), "nothing behind the blocked head may be assigned"
+    assert any("head of line" in r for r in d.reasons)
+    assert any("head of line" in a for a in d.alerts), "a blocked head is an anomaly"
+    # ...and the fleet still fixes it: an instance of the shape it wants is created.
+    assert 60 in d.create
+
+
+def test_the_vcpu_quota_binds_before_the_instance_count():
+    """S6, superseding D3. 40 vCPU of quota is five 8-vCPU instances, not twenty-five.
+
+    D3's rule -- count instances, not vCPUs -- holds only for a uniform fleet. With the
+    instance cap raised out of the way the vCPU quota is what must bind, or the
+    controller takes a Nova rejection instead, which is the failure D3 wrote its rule
+    to avoid.
+    """
+    limits = Limits(max_instances=25, assign=True, sizes=LADDER, max_vcpus=40)
+    d = decide(state(waiting=waiting(*[MIN * 3] * 10, sizes=[30] * 10)), limits)
+    assert len(d.create) == 5, "40 vCPU / 8 per instance"
+    assert any("head of line" in a for a in d.alerts)
+
+
+def test_the_ram_quota_binds_at_the_larger_rung():
+    """Nine 125 GB instances exhaust 1220 GB, which is S6's worked example."""
+    ladder = (SizeSpec(memory_gb=125, vcpus=32),)
+    limits = Limits(
+        max_instances=25, assign=True, sizes=ladder, max_vcpus=320, max_ram_gb=1220
+    )
+    d = decide(state(waiting=waiting(*[MIN * 3] * 12, sizes=[125] * 12)), limits)
+    assert len(d.create) == 9, "1220 GB / 125 per instance"
+
+
+def test_quota_counts_what_is_already_live():
+    limits = Limits(max_instances=25, assign=True, sizes=LADDER, max_vcpus=40)
+    d = decide(
+        state(
+            instances=[inst("a", size=30), inst("b", size=30)],
+            spent=["a", "b"],
+            waiting=waiting(*[MIN * 3] * 10, sizes=[30] * 10),
+        ),
+        limits,
+    )
+    assert len(d.create) == 3, "two live instances already hold 16 of the 40 vCPU"
+
+
+def test_a_create_that_will_not_fit_stops_the_ones_behind_it():
+    """S7 again, on the create path: strictly oldest-first, no skipping.
+
+    40 vCPU of quota. Two 60 GB instances (16 vCPU each) fit, the third does not -- and
+    the 30 GB submission behind it *would* fit in the remaining 8 vCPU. It must still
+    not be created: that is the difference between stopping and skipping, and the
+    quota has to be sized so the two answers differ or this test pins nothing. (It
+    originally used 32 vCPU, where the trailing 30 did not fit either and `continue`
+    passed the suite unchanged -- caught by mutation, not by review.)
+    """
+    limits = Limits(max_instances=25, assign=True, sizes=LADDER, max_vcpus=40)
+    d = decide(
+        state(
+            waiting=waiting(
+                MIN * 9, MIN * 8, MIN * 7, MIN * 2, sizes=[60, 60, 60, 30]
+            )
+        ),
+        limits,
+    )
+    assert d.create == (60, 60)
+    assert any("does not fit the quota" in a for a in d.alerts)
+
+
+def test_a_size_that_left_the_catalogue_is_visible_not_silently_downgraded():
+    """S1 calls withdrawing a rung a compatibility event; this is what it looks like.
+
+    The dangerous handling is rounding 125 down to 60 and running the analysis on
+    hardware it was never sized for. It blocks instead, loudly, and ages out through
+    `sivacor.assignment_timeout` as `reaped_no_worker` -- which points at the fleet.
+    """
+    d = decide(state(waiting=waiting(MIN * 3, sizes=[125])), SIZED)
+    assert d.create == ()
+    assert any("not in the catalogue" in a for a in d.alerts)
+
+
+def test_an_unsized_submission_gets_the_cheapest_rung():
+    """Pre-P1 submissions have no `requested_memory_gb`, and guessing up costs money."""
+    d = decide(state(waiting=waiting(MIN * 3)), SIZED)
+    assert d.create == (30,)
+
+
+def test_an_untagged_instance_counts_as_the_cheapest_rung():
+    """Pre-P3 instances have no size tag. Under-counting cannot stall anything; Nova
+    refusing the create is backpressure `QuotaExceeded` already handles (S6)."""
+    d = decide(
+        state(
+            instances=[inst("legacy")],
+            ready=["legacy"],
+            waiting=waiting(MIN * 3, sizes=[30]),
+        ),
+        SIZED,
+    )
+    assert d.assign == (("sub-0", "id-legacy"),), "matched to the smallest rung"
+    assert d.create == ()
+
+
+def test_unarmed_keeps_the_scalar_arithmetic_even_with_a_catalogue():
+    """The guard that lets P3 land while production still runs the shared queue.
+
+    Unarmed, a 30 GB instance IS capacity for a 60 GB submission, because on the shared
+    queue any worker consumes any message -- size gates nothing. So the scalar reading
+    is the correct one there, and the per-size path must not run: it would see a
+    shortfall of one and boot an instance nobody needs, on the deployment least able to
+    afford a surprise.
+
+    This is the test mutation testing said was missing: dropping `limits.assign` from
+    that condition passed the whole suite.
+    """
+    s = state(
+        depth=1,
+        instances=[inst("small", size=30)],
+        waiting=waiting(timedelta(minutes=5), sizes=[60]),
+    )
+    unarmed = decide(s, Limits(max_instances=5, sizes=LADDER))
+    assert unarmed.create == (), "an available worker will take it off the shared queue"
+    assert unarmed.assign == (), "unarmed, this controller places nothing"
+
+    # Armed, the same state is a real shortfall: nothing will hand that message to the
+    # 30 GB box, and the 60 GB submission needs hardware that does not exist yet.
+    assert decide(s, replace(SIZED, max_instances=5)).create == (60,)
+
+
+def test_unarmed_creates_are_unsized():
+    """Demand from queue depth carries no size, so the caller boots its own default."""
+    d = decide(state(depth=2), Limits(max_instances=5, sizes=LADDER))
+    assert d.create == (None, None)

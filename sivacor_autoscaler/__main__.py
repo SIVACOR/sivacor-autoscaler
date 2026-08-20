@@ -242,7 +242,14 @@ def main() -> int:
               f"{sum(i.is_live for i in state.instances)}/{len(state.instances)}")
         for reason in decision.reasons:
             print(f"  {reason}")
-        print(f"would create {decision.create}, delete {len(decision.delete)}")
+        shapes = ", ".join(
+            f"{r} GB" if r is not None else "unsized" for r in decision.create
+        )
+        print(
+            f"would create {len(decision.create)}"
+            + (f" ({shapes})" if decision.create else "")
+            + f", delete {len(decision.delete)}"
+        )
         return 0
 
     if args.once:

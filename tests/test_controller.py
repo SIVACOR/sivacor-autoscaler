@@ -163,7 +163,7 @@ def _armed(monkeypatch, ctl, conn):
 
     monkeypatch.setattr(controller_mod.fleet, "create_instance", create_instance)
     # decide() is not under test here; drive the create loop directly.
-    monkeypatch.setattr(controller_mod, "decide", lambda state, limits: Decision(create=1))
+    monkeypatch.setattr(controller_mod, "decide", lambda state, limits: Decision(create=(None,)))
     monkeypatch.setattr(
         ctl, "gather", lambda limits=None: FleetState(queue_depth=1, serving=0, now=NOW)
     )

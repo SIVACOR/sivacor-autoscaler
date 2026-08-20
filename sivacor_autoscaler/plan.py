@@ -17,6 +17,24 @@ from datetime import datetime, timedelta
 
 
 @dataclass(frozen=True)
+class SizeSpec:
+    """One rung of the worker-size catalogue, as much of it as the arithmetic needs.
+
+    The catalogue proper lives in Girder (``sivacor.worker_sizes``, P0.3) and carries a
+    ``flavor`` name and a ``gated`` flag as well. Neither reaches here: S1 keeps the
+    ``m3.*`` name server-side only, and ``gated`` guards the *picker* (P4), not the
+    fleet. So this is deliberately the two numbers the quota arithmetic needs and
+    nothing else -- if a third field ever seems necessary here, check first whether the
+    decision really belongs in a pure function over quotas.
+    """
+
+    #: Advertised RAM in GiB. Both the enum value a submission asks for and the key
+    #: everything here matches on -- S1's "the class *is* the number".
+    memory_gb: int
+    vcpus: int
+
+
+@dataclass(frozen=True)
 class Instance:
     """One worker VM, as much of it as the decision needs."""
 
@@ -24,6 +42,20 @@ class Instance:
     name: str
     status: str
     created_at: datetime | None = None
+
+    #: Which catalogue rung this instance *is*, by advertised RAM. From the
+    #: ``sivacor-size:<n>`` tag written at create time, with the flavour name as a
+    #: fallback (:func:`fleet.list_fleet`).
+    #:
+    #: ``None`` means neither could be resolved -- an instance booted before P3, or one
+    #: whose flavour is not in the catalogue. Counted as the *smallest* rung for quota
+    #: purposes, which under-counts rather than over-counts on purpose: over-counting
+    #: invents a quota wall and stalls submissions, while under-counting merely lets
+    #: Nova refuse the create, and ``QuotaExceeded`` already treats that as backpressure
+    #: (S6 keeps it as the outer net for exactly this reason). It also means an
+    #: unsized instance can only ever be matched to a smallest-rung submission, so it is
+    #: never mistaken for capacity a large submission could use.
+    size: int | None = None
 
     @property
     def is_live(self) -> bool:
@@ -68,9 +100,13 @@ class WaitingSubmission:
     age: timedelta
 
     #: Advertised RAM the submission asked for, per ``meta.requested_memory_gb``.
-    #: ``None`` until P3 teaches the controller to read it -- at P2 the catalogue
-    #: holds one rung, so every submission fits every instance and the field is
-    #: deliberately unused by :func:`decide`.
+    #:
+    #: ``None`` means the submission predates P1's recording of it. Treated as the
+    #: smallest catalogue rung -- the cheapest shape, and the one a pre-P1 submission
+    #: actually ran on, since every deployment booted ``SIVACOR_OS_FLAVOR``'s default
+    #: ``m3.medium`` (measured on the mirror 2026-08-20: ``MemTotal`` 29.37 GiB,
+    #: 8 vCPU). Defaulting *up* would silently double the SU cost of the oldest
+    #: submissions in the queue, which is the direction nobody would notice.
     memory_gb: int | None = None
 
     #: Whether this submission is *ours* to place, per ``meta.awaiting_assignment``.
@@ -184,6 +220,31 @@ class Limits:
     #: the fleet deadlocks on capacity it will never assign to.
     assign_max_age: timedelta = timedelta(minutes=8)
 
+    #: The worker-size catalogue, from Girder's ``sivacor.worker_sizes`` (P0.3).
+    #:
+    #: **Empty means "one shape, unknown", which is the pre-P3 behaviour exactly.** With
+    #: no catalogue every submission and every instance collapses to a single anonymous
+    #: rung, so the arithmetic below reduces term-for-term to what it was: size buckets
+    #: of one, no vCPU/RAM checks, ``zip`` in the assigner. That equivalence is what lets
+    #: this land unarmed, and :func:`decide`'s tests assert it.
+    sizes: tuple[SizeSpec, ...] = ()
+
+    #: OpenStack quota on vCPU and on RAM, in GiB. **``None`` disables each check, and
+    #: that is the default on purpose** -- the same reasoning as
+    #: :attr:`provision_deadline`. Enabling them against a fleet whose instances have no
+    #: ``sivacor-size:`` tag makes every live instance count as the smallest rung, which
+    #: *under*-counts usage and so cannot stall anything; but it also makes the numbers
+    #: in the log wrong until the fleet has turned over, so turn them on knowing that.
+    #:
+    #: S6 supersedes D3 here: D3's "count instances, not vCPUs" holds only while every
+    #: instance is the same shape. Read live 2026-08-13 the quota is 25 instances /
+    #: 320 vCPU / 1220 GiB, so the instance count binds **only at the bottom rung** --
+    #: at 125 GiB the RAM quota binds at nine, and a controller enforcing
+    #: ``max_instances`` alone would take a Nova rejection instead, which is the very
+    #: failure D3 wrote its rule to avoid.
+    max_vcpus: int | None = None
+    max_ram_gb: int | None = None
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -228,7 +289,15 @@ class FleetState:
 
 @dataclass(frozen=True)
 class Decision:
-    create: int = 0
+    #: One entry per instance to boot, each the ``memory_gb`` rung it must be, ordered
+    #: oldest-submission-first (S7). A tuple rather than a count because the fleet is
+    #: heterogeneous from P3 on: "create 3" no longer says what to create.
+    #:
+    #: ``None`` in place of a rung means "whatever :attr:`Limits.sizes` cannot tell us"
+    #: -- demand read from queue *depth* rather than from a submission document, which
+    #: carries no size. The caller boots its configured default for those. Only
+    #: reachable while targeted assignment is off, i.e. on the shared-queue path.
+    create: tuple[int | None, ...] = ()
     delete: tuple[str, ...] = ()
     #: ``(submission id, instance id)`` pairs to bind, oldest submission first (S7).
     #: The caller claims each submission atomically and *then* publishes its chain to
@@ -308,6 +377,24 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     consumer is a stall no signal can see. Instances past
     :attr:`Limits.assign_max_age` are excluded from both -- one that will never be
     assigned to must not absorb demand.
+
+    **Sizes (P3).** Once :attr:`Limits.sizes` holds a catalogue *and* assignment is
+    armed, both halves become per-size: a submission is only matched to an instance of
+    the shape it asked for, and :attr:`Decision.create` says which shape each new
+    instance must be. Scarce headroom is allocated strictly oldest-submission-first and
+    **stops** at the first submission that does not fit, in both halves (S7).
+
+    Two invariants hold this together, and both are asserted by the tests:
+
+    * **With no catalogue, or with assignment off, this function is what it was.** The
+      per-size path is behind that conjunction precisely so P3 can land while production
+      still runs the shared queue -- the branch production takes is the code it already
+      ran. Bucket-of-one reduces the matching to the ``zip`` it replaced and the
+      allocation to ``clamp(demand - available, 0, headroom)``.
+    * **Headroom is the minimum across three quotas, not just the instance count** (S6,
+      superseding D3). :attr:`Limits.max_vcpus` and :attr:`Limits.max_ram_gb` default to
+      ``None``, i.e. off, so enabling them is a deliberate act on a fleet whose instances
+      carry size tags.
     """
     reasons: list[str] = []
     alerts: list[str] = []
@@ -433,9 +520,41 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         # submission Girder already dispatched is still demand, but publishing a second
         # chain for it would put two workers on one workspace.
         placeable = tuple(w for w in _oldest_first(state.waiting) if w.assignable)
-        # Oldest submission first (S7). One size means everything fits everywhere, so a
-        # plain zip; P3 adds the size filter and the head-of-line stop.
-        for sub, inst in zip(placeable, assignable):
+        # Oldest submission first (S7), and only onto an instance of the shape it asked
+        # for. With no catalogue every submission and every instance resolves to the same
+        # anonymous rung, so this reduces exactly to the plain zip it replaced.
+        pools: dict[int | None, list[Instance]] = {}
+        for candidate in assignable:
+            pools.setdefault(_instance_rung(candidate, limits), []).append(candidate)
+        for sub in placeable:
+            want = _submission_rung(sub, limits)
+            pool = pools.get(want)
+            if not pool:
+                # **Stop, do not skip (S7).** Serving a smaller submission behind this
+                # one raises utilisation and starves the large sizes indefinitely: under
+                # a steady stream of small submissions the expensive one is always the
+                # one that does not fit. It is also unexplainable to a researcher, who
+                # would watch later submissions run while theirs waited.
+                #
+                # Only worth a line when instances were actually available and the wrong
+                # shape. Running out of instances entirely is the ordinary scale-from-zero
+                # case, already covered by the "none assignable" reason below.
+                if any(pools.values()):
+                    line = (
+                        f"head of line: submission {sub.id} wants {want} GB and no "
+                        f"instance of that size is free, so nothing behind it is "
+                        f"assigned this tick (free: "
+                        + ", ".join(
+                            f"{k} GB x{len(v)}" for k, v in sorted(
+                                pools.items(), key=lambda kv: (kv[0] is None, kv[0])
+                            ) if v
+                        )
+                        + "). Creating one instead"
+                    )
+                    reasons.append(line)
+                    alerts.append(line)
+                break
+            inst = pool.pop(0)
             assign.append((sub.id, inst.id))
             reasons.append(
                 f"assign submission {sub.id} -> {inst.name}: waiting {sub.age}, "
@@ -519,9 +638,28 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         )
         reasons.append(line)
         alerts.append(line)
-    shortfall = demand - len(available)
     headroom = limits.max_instances - len(live)
-    create = max(0, min(shortfall, headroom))
+    if limits.assign and limits.sizes:
+        # Per size, because an available instance of the *wrong shape* is not available
+        # to this submission -- the one assumption the scalar formula below makes that
+        # stops being true once the fleet is heterogeneous. Two 60 GB submissions and one
+        # idle 30 GB instance is a shortfall of two, not one.
+        wanted = _wanted_rungs(state, limits, available, stalled)
+        shortfall = len(wanted)
+        create_sizes = _allocate(wanted, live, limits, headroom, reasons, alerts)
+    else:
+        # Unarmed, or no catalogue: size information is absent end to end. Nothing is
+        # placed by this controller, and every instance is the one shape
+        # ``SIVACOR_OS_FLAVOR`` names -- so this is the pre-P3 arithmetic, term for term,
+        # asking for unsized creates.
+        #
+        # **Keeping the two paths separate is what lets P3 land while production is
+        # still flag-off**: the branch production takes is byte-for-byte the code it
+        # already ran, so a regression there cannot be P3's. Same reasoning as the phase
+        # order itself.
+        shortfall = demand - len(available)
+        create_sizes = (None,) * max(0, min(shortfall, headroom))
+    create = len(create_sizes)
     spent_live = len([i for i in live if i.id in state.spent])
     # Surfaced only when non-zero: on a healthy fleet it is noise on every tick, and
     # when it is non-zero it is the first thing worth seeing.
@@ -535,6 +673,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
                 f"BREAKER OPEN: {state.consecutive_failures} consecutive instances "
                 f"failed to register; refusing to create {create}. Deletes continue."
             )
+        create_sizes = ()
         create = 0
     elif shortfall <= 0:
         reasons.append(
@@ -558,7 +697,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         )
 
     return Decision(
-        create=create,
+        create=create_sizes,
         delete=tuple(delete),
         assign=tuple(assign),
         reasons=tuple(reasons),
@@ -567,6 +706,146 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         reap_reasons=reap_reasons,
     )
 
+
+
+def _smallest_rung(limits) -> int | None:
+    """The cheapest rung in the catalogue, or ``None`` when there is no catalogue.
+
+    The fallback for everything whose size is unknown. Cheapest rather than largest on
+    purpose: guessing *up* silently multiplies SU cost, and nobody reviews a bill for
+    instances that all ran successfully.
+    """
+    return min((s.memory_gb for s in limits.sizes), default=None)
+
+
+def _submission_rung(sub: WaitingSubmission, limits) -> int | None:
+    """Which rung ``sub`` needs.
+
+    A missing ``memory_gb`` means a pre-P1 submission and resolves to the smallest rung
+    -- see :attr:`WaitingSubmission.memory_gb`. A value that is *not* in the catalogue is
+    returned unchanged rather than rounded to something that exists: the catalogue
+    shrinking under a queued submission is S1's "compatibility event", and the honest
+    outcome is a visible head-of-line block naming the size it wants, not a silent
+    downgrade onto hardware the run was never sized for. It then ages out through
+    ``sivacor.assignment_timeout`` as ``reaped_no_worker``, which says the fleet is the
+    problem -- which it is.
+    """
+    if not limits.sizes:
+        return None
+    return sub.memory_gb if sub.memory_gb is not None else _smallest_rung(limits)
+
+
+def _instance_rung(inst: Instance, limits) -> int | None:
+    """Which rung ``inst`` *is*, for matching and for quota arithmetic.
+
+    Unlike :func:`_submission_rung`, an unrecognised size here **does** collapse to the
+    smallest rung: see :attr:`Instance.size` for why under-counting an instance is the
+    safe direction where under-serving a submission is not.
+    """
+    if not limits.sizes:
+        return None
+    known = {s.memory_gb for s in limits.sizes}
+    return inst.size if inst.size in known else _smallest_rung(limits)
+
+
+def _spec(limits, rung: int | None) -> SizeSpec | None:
+    """The catalogue entry for ``rung``, or ``None`` if there isn't one."""
+    for spec in limits.sizes:
+        if spec.memory_gb == rung:
+            return spec
+    return None
+
+
+def _quota_used(live, limits) -> tuple[int, int]:
+    """vCPU and RAM (GiB) the live fleet already holds against the quota."""
+    vcpus = ram = 0
+    for inst in live:
+        if spec := _spec(limits, _instance_rung(inst, limits)):
+            vcpus += spec.vcpus
+            ram += spec.memory_gb
+    return vcpus, ram
+
+
+def _wanted_rungs(state, limits, available, stalled) -> list[int | None]:
+    """One rung per unit of demand no existing instance can serve, oldest first (S7).
+
+    The matching pass and the ordering are the same walk on purpose: doing them
+    separately would mean deciding *how many* instances to create from one snapshot and
+    *which submission each is for* from another, which is the two-owners failure S3
+    exists to avoid, reproduced inside a single function.
+    """
+    pools: dict[int | None, int] = {}
+    for inst in available:
+        rung = _instance_rung(inst, limits)
+        pools[rung] = pools.get(rung, 0) + 1
+    out: list[int | None] = []
+    for sub in _oldest_first(stalled):
+        rung = _submission_rung(sub, limits)
+        if pools.get(rung):
+            pools[rung] -= 1
+        else:
+            out.append(rung)
+    # Depth beyond what Girder accounts for: messages sitting in the shared queue, which
+    # carry no size. Should be zero whenever assignment is armed -- nothing publishes
+    # there -- but kept so this path still matches the ``max(depth, len(waiting))``
+    # reading above during rollout step 3, and errs towards provisioning.
+    out += [None] * max(0, state.queue_depth - len(stalled))
+    return out
+
+
+def _allocate(wanted, live, limits, headroom, reasons, alerts) -> tuple[int | None, ...]:
+    """Turn wanted rungs into creates, oldest first, stopping at the first that will not
+    fit (S7).
+
+    **Strictly head-of-line: no skipping past a submission that does not fit.** Skipping
+    raises utilisation and starves the large sizes forever, because the expensive
+    submission is always the one that does not fit. See S7.
+
+    The instance cap is left to the caller's ``CAPPED`` line rather than logged here --
+    it is the ordinary busy-fleet reading and already has a message that names the cap.
+    A *quota* stop is different: it is the failure D3's instance-only rule left the door
+    open for, and a submission waiting behind a quota it cannot name is the least
+    debuggable state this design can produce.
+    """
+    used_v, used_r = _quota_used(live, limits)
+    out: list[int | None] = []
+    for rung in wanted:
+        if len(out) >= headroom:
+            break
+        spec = _spec(limits, rung)
+        if spec is None and rung is not None:
+            line = (
+                f"head of line: a submission wants {rung} GB, which is not in the "
+                f"catalogue ({', '.join(str(s.memory_gb) for s in limits.sizes)}). "
+                "Nothing behind it is created this tick. The catalogue shrank under a "
+                "queued submission; it will fail as reaped_no_worker unless the rung "
+                "comes back"
+            )
+            reasons.append(line)
+            alerts.append(line)
+            break
+        need_v = spec.vcpus if spec else 0
+        need_r = spec.memory_gb if spec else 0
+        over = []
+        if limits.max_vcpus is not None and used_v + need_v > limits.max_vcpus:
+            over.append(f"vCPU {used_v}+{need_v} > {limits.max_vcpus}")
+        if limits.max_ram_gb is not None and used_r + need_r > limits.max_ram_gb:
+            over.append(f"RAM {used_r}+{need_r} > {limits.max_ram_gb} GB")
+        if over:
+            line = (
+                f"head of line: a {rung} GB instance does not fit the quota ("
+                + "; ".join(over)
+                + "), so nothing behind it is created this tick. Strictly oldest-first "
+                "(S7): skipping to a smaller submission that does fit would starve this "
+                "one indefinitely"
+            )
+            reasons.append(line)
+            alerts.append(line)
+            break
+        out.append(rung)
+        used_v += need_v
+        used_r += need_r
+    return tuple(out)
 
 
 def _oldest_first(waiting) -> tuple[WaitingSubmission, ...]:

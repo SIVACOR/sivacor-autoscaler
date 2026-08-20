@@ -274,8 +274,25 @@ class Controller:
                     exc_info=True,
                 )
 
-        for _ in range(decision.create):
+        for rung in decision.create:
             try:
+                # `rung` is the catalogue size this instance must be, or None for
+                # "unsized" -- demand read from queue depth, which carries no size.
+                #
+                # **Every rung is None until P3.2 wires the catalogue**, because
+                # `decide()` only emits sized creates when `Limits.sizes` is non-empty
+                # and nothing populates it yet. So the flavour below is still the one
+                # `SIVACOR_OS_FLAVOR` names, exactly as before, and this loop is a
+                # rename of `range(decision.create)`. Asserting it rather than
+                # commenting it: a sized rung arriving here before the mapping exists
+                # would silently boot the wrong shape.
+                if rung is not None:
+                    logger.warning(
+                        "decision asked for a %s GB instance but this build has no "
+                        "size->flavor mapping yet (P3.2); booting %s regardless",
+                        rung,
+                        self.cfg.flavor,
+                    )
                 user_data = fleet.build_user_data(
                     self.cfg.template,
                     master_key_hex=self.cfg.master_key_hex,
