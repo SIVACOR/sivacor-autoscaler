@@ -12,6 +12,7 @@ next thing refused a volume is the manager. Instances are far more forgiving: 25
 them, and a stuck one is caught by the max-lifetime sweep.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -498,7 +499,52 @@ def test_another_deployments_volumes_are_not_listed():
 # --- the reap gate --------------------------------------------------------
 
 
-def test_reclaim_is_not_gated_on_the_live_setting(tmp_path):
+def test_the_reap_path_does_not_try_to_delete_the_volume(tmp_path, caplog):
+    """It cannot work, and trying produces a false leak alarm on every reap.
+
+    Once ``delete_instance`` has run the server is in ``task_state deleting``: Nova
+    refuses the detach and Cinder refuses the delete of a still-attached volume. The
+    old code then logged *"could not delete volume ... it now holds quota until
+    reclaimed by hand"* for a volume Nova removed 26 s later -- every single reap,
+    observed on the mirror 2026-08-21.
+
+    **A false leak alarm is worse than no alarm.** The count quota is the one genuinely
+    scary number in this feature, and an operator trained to ignore that line will
+    ignore it when it is real.
+    """
+    caplog.set_level(logging.INFO)
+    cloud = _Cloud()
+    cloud.servers_list = [_Server("server-1", status="SHUTOFF")]
+    cloud.volumes_ = [_Volume("vol-7", fleet.volume_name(DEPLOYMENT))]
+    ctl = Controller(
+        cloud, _Redis(depth=0), _Girder(volumes_enabled=False), _cfg(tmp_path)
+    )
+
+    ctl.step()
+
+    assert cloud.deleted_servers == ["server-1"]
+    assert cloud.deleted_volumes == [], "delete_on_termination reclaims it, not us"
+    assert "holds quota until reclaimed by hand" not in caplog.text
+    # Still named in the log, so a real leak stays cross-checkable.
+    assert "vol-7" in caplog.text
+    assert "rides out with" in caplog.text
+
+
+def test_the_create_rollback_still_deletes_its_volume(tmp_path):
+    """The other caller, which genuinely holds an *unattached* volume.
+
+    Dropping the delete from the reap path must not drop it here: this volume's
+    instance never existed, so no termination hook can ever reclaim it.
+    """
+    cloud = _Cloud(server_error=RuntimeError("nova said no"))
+    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
+
+    ctl.step()
+
+    assert cloud.deleted_volumes, "an orphan with no instance must still be deleted"
+
+
+def test_reclaim_is_not_gated_on_the_live_setting(tmp_path, caplog):
     """Disarming must not leak every in-flight volume.
 
     An instance booted while armed still has a volume after someone turns the setting
@@ -518,10 +564,14 @@ def test_reclaim_is_not_gated_on_the_live_setting(tmp_path):
         cloud, _Redis(depth=0), _Girder(volumes_enabled=False), _cfg(tmp_path)
     )
 
+    caplog.set_level(logging.INFO)
     ctl.step()
 
     assert cloud.deleted_servers == ["server-1"], "the SHUTOFF instance is reaped"
-    assert "vol-7" in cloud.deleted_volumes, "and its volume goes with it"
+    # The volume is reclaimed by delete_on_termination, so what this asserts is that
+    # the attachment was still LOOKED UP after a disarm -- gating that lookup on the
+    # live flag is what would lose track of in-flight volumes entirely.
+    assert "vol-7" in caplog.text, "its volume is still accounted for"
 
 
 def test_a_deployment_with_no_volumes_configured_pays_no_call(tmp_path):

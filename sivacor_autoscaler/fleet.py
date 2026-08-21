@@ -152,12 +152,20 @@ def create_volume(conn, cfg, size_gb: int) -> str:
 
 
 def delete_volume(conn, volume_id: str, instance_id: str | None = None) -> None:
-    """Detach if attached, then delete. Best effort, and says so when it fails.
+    """Delete a volume that is **not attached to a server being deleted**.
 
-    Ordered detach-then-delete rather than relying on ``delete_on_termination`` alone,
-    because this is the path that logs a sentence an operator can read -- and because
-    it also covers the volume whose *instance* creation failed after the volume
-    existed, which no termination hook can reach.
+    Two callers, and both hold an unattached volume: the create rollback (the volume
+    exists, its instance never did) and, later, C5's sweep.
+
+    **Not for the reap path.** Once ``delete_instance`` has been called the server is in
+    ``task_state deleting``, Nova refuses the detach (`Cannot 'detach_volume' ... while
+    it is in task_state deleting`) and Cinder then refuses the delete because the volume
+    is still attached. Reaping is handled by ``delete_on_termination`` on the block
+    device mapping instead -- measured working on the mirror 2026-08-21, where Nova
+    removed the volume 26 s after this function had already declared it leaked.
+
+    The detach is still attempted when ``instance_id`` is given, for the sweep's case:
+    a volume attached to an instance that is *live* but broken.
     """
     if instance_id:
         try:

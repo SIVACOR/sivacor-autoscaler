@@ -314,12 +314,28 @@ class Controller:
                 fleet.delete_instance(self.conn, instance_id)
             except Exception:
                 logger.warning("could not delete %s", instance_id, exc_info=True)
-            # After the server, and best effort. `delete_on_termination` means Nova has
-            # probably already removed these, so `ignore_missing` is doing real work
-            # here rather than papering over a bug -- this is the belt to that braces,
-            # and the path that logs a sentence naming the volume.
+            # **Do not try to delete these.** `delete_on_termination` on the block
+            # device mapping means Nova reclaims them with the server, and the explicit
+            # path cannot work here anyway: the detach is refused with `Cannot
+            # 'detach_volume' ... while it is in task_state deleting`, and Cinder then
+            # refuses the delete because the volume is still attached. Attempting it
+            # produced a `could not delete volume ... it now holds quota until
+            # reclaimed by hand` warning on **every** reap, for a volume Nova removed
+            # 26 s later -- observed on the mirror 2026-08-21. A false leak alarm is
+            # worse than none: the count quota is the one genuinely scary number in
+            # this feature, and an operator who learns to ignore that line will ignore
+            # it when it is true.
+            #
+            # Logged rather than silent, so a real leak is still cross-checkable
+            # against `openstack volume list`. If Nova ever fails to honour the flag,
+            # C5's sweep is what catches it -- and until C5 exists that is an open gap,
+            # not a covered one.
             for volume_id in volumes:
-                fleet.delete_volume(self.conn, volume_id, instance_id=instance_id)
+                logger.info(
+                    "volume %s rides out with %s (delete_on_termination)",
+                    volume_id,
+                    instance_id,
+                )
 
         # Assignments before creates: placing work on an instance that already exists is
         # the cheap half, and a create that fails must not stop it. Each binding is
