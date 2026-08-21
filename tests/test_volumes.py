@@ -26,9 +26,15 @@ NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 
 
 class _Volume:
-    def __init__(self, id, name, attachments=()):
+    def __init__(self, id, name, attachments=(), age_minutes=60):
         self.id, self.name = id, name
         self.attachments = list(attachments)
+        # Cinder reports created_at with NO timezone -- verified on live JS2 -- which is
+        # the shape that makes an aware/naive subtraction raise. The fake reproduces
+        # that rather than the friendlier `Z` form Nova uses for servers.
+        self.created_at = (NOW - timedelta(minutes=age_minutes)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000000"
+        )
 
 
 class _Attachment:
@@ -518,10 +524,13 @@ def test_unattached_volumes_of_ours_are_identifiable():
         _Volume("vol-3", "sivacor"),  # the assetstore volume, never ours
     ]
 
-    found = dict(fleet.list_worker_volumes(cloud, DEPLOYMENT))
+    found = {
+        v.id: v.attached
+        for v in fleet.list_worker_volumes(cloud, DEPLOYMENT, now=NOW)
+    }
 
     assert found == {"vol-1": True, "vol-2": False}
-    assert "vol-3" not in found
+    assert "vol-3" not in found, "the 800 GB assetstore volume must never be ours"
 
 
 def test_another_deployments_volumes_are_not_listed():
@@ -529,7 +538,7 @@ def test_another_deployments_volumes_are_not_listed():
     cloud = _Cloud()
     cloud.volumes_ = [_Volume("vol-1", fleet.volume_name("sivacor.org"))]
 
-    assert fleet.list_worker_volumes(cloud, DEPLOYMENT) == ()
+    assert fleet.list_worker_volumes(cloud, DEPLOYMENT, now=NOW) == ()
 
 
 # --- the reap gate --------------------------------------------------------
@@ -798,3 +807,134 @@ def test_an_instance_with_no_volume_tag_counts_as_zero():
     )
 
     assert len(d.create) == 1
+
+
+# --- C5.1: the orphan sweep ------------------------------------------------
+#
+# The only thing in the system that looks for a volume nothing is using. Since C2 the
+# reap path deliberately leaves attached volumes to delete_on_termination -- attempting
+# the delete produced a false leak alarm on every reap -- so if that flag ever fails to
+# fire, this is what notices. The project has 10 volumes in total.
+
+from sivacor_autoscaler.plan import WorkerVolume
+
+
+def _vols(*specs):
+    return tuple(
+        WorkerVolume(id=i, attached=a, age=_td(minutes=m)) for i, a, m in specs
+    )
+
+
+def test_an_unattached_volume_past_the_grace_is_reclaimed():
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", False, 30))),
+        _armed(volume_orphan_grace=_td(minutes=15)),
+    )
+
+    assert d.delete_volumes == ("vol-1",)
+
+
+def test_an_attached_volume_is_never_swept():
+    """However old. An attached volume has a worker behind it, and a long-running
+    submission is not an orphan -- the corpus has a 36.9-hour run in it."""
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", True, 60 * 40))),
+        _armed(volume_orphan_grace=_td(minutes=15)),
+    )
+
+    assert d.delete_volumes == ()
+
+
+def test_a_volume_inside_the_grace_is_left_alone():
+    """**The race the grace exists for, and it is not hypothetical.**
+
+    The create path makes the volume *before* the instance -- it has to, because the
+    boot block needs the volume id in its user-data -- so every healthy volume is
+    briefly unattached. Measured on the mirror: created 16:39:21, attached by 16:40:02.
+    A sweep with no grace would delete volumes that are about to be used, turning a
+    safety net into the very leak-plus-failure it exists to prevent.
+    """
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", False, 1))),
+        _armed(volume_orphan_grace=_td(minutes=15)),
+    )
+
+    assert d.delete_volumes == ()
+
+
+def test_the_sweep_is_off_unless_a_grace_is_configured():
+    """Off is the default, and off means nothing looks. Deliberate: a sweep that
+    deletes is not something to enable by accident."""
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", False, 999))),
+        _armed(),
+    )
+
+    assert d.delete_volumes == ()
+
+
+def test_a_reclaim_is_an_alert_not_a_log_line():
+    """Every one of these is a leak that happened or a bug that caused one.
+
+    A silent sweep is indistinguishable from a leak nobody noticed, which is the whole
+    argument for the sweep existing.
+    """
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", False, 30))),
+        _armed(volume_orphan_grace=_td(minutes=15)),
+    )
+
+    assert any("orphaned volume vol-1" in a for a in d.alerts), d.alerts
+    assert any("delete_on_termination" in a for a in d.alerts), (
+        "the message should name the mechanism that was supposed to handle it"
+    )
+
+
+def test_volume_ids_never_reach_the_instance_delete_list():
+    """Separate fields on purpose: a volume id passed to delete_instance would ask Nova
+    to delete a server that does not exist, and the reverse would be worse."""
+    d = decide(
+        FleetState(queue_depth=0, serving=0, now=NOW,
+                   volumes=_vols(("vol-1", False, 30))),
+        _armed(volume_orphan_grace=_td(minutes=15)),
+    )
+
+    assert d.delete == ()
+    assert d.delete_volumes == ("vol-1",)
+
+
+def test_the_sweep_runs_after_the_instance_deletes(tmp_path, monkeypatch):
+    """Ordering, through step(). A volume whose instance was just reaped is reclaimed by
+    delete_on_termination; sweeping first would race that and log a reclaim for
+    something Nova was already handling. Anything still there next tick is real."""
+    from sivacor_autoscaler import controller as controller_mod
+    from sivacor_autoscaler.plan import Decision
+
+    order = []
+    cloud = _Cloud()
+    cloud.servers_list = [_Server("server-1", status="SHUTOFF", volume_gb=10)]
+    monkeypatch.setattr(
+        controller_mod,
+        "decide",
+        lambda state, limits: Decision(
+            delete=("server-1",), delete_volumes=("vol-orphan",)
+        ),
+    )
+    monkeypatch.setattr(
+        controller_mod.fleet, "delete_instance",
+        lambda conn, i: order.append(("instance", i)),
+    )
+    monkeypatch.setattr(
+        controller_mod.fleet, "delete_volume",
+        lambda conn, v, instance_id=None: order.append(("volume", v)),
+    )
+
+    ctl = Controller(cloud, _Redis(depth=0), _Girder(), _cfg(tmp_path))
+    ctl.step()
+
+    assert order == [("instance", "server-1"), ("volume", "vol-orphan")]

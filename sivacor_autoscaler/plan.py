@@ -285,6 +285,23 @@ class Limits:
     max_volumes: int | None = None
     max_volume_gb: int | None = None
 
+    #: How long an *unattached* volume of ours may exist before it is swept.
+    #: ``None`` disables the sweep, which is the default and the pre-C5 behaviour.
+    #:
+    #: **The grace is not politeness, it is correctness.** The create path makes the
+    #: volume before the instance -- it has to, because the boot block needs the volume
+    #: id in its user-data -- so every healthy volume is briefly unattached. Measured on
+    #: the mirror: created 16:39:21, attached by 16:40:02, so the window is under a
+    #: minute. A sweep with no grace would race that and delete volumes about to be used.
+    #:
+    #: **Why the sweep exists at all.** Since C2 the reap path deliberately does not try
+    #: to delete an attached volume -- Nova refuses the detach during ``task_state
+    #: deleting`` and Cinder refuses to delete an attached volume, so the attempt only
+    #: produced a false leak alarm on every reap. ``delete_on_termination`` reclaims
+    #: those instead. That leaves exactly one gap: if Nova ever fails to honour it,
+    #: nothing else looks. This is what looks.
+    volume_orphan_grace: timedelta | None = None
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -303,6 +320,10 @@ class FleetState:
     #: still rests on evidence that celery worked, but by a different route: only a
     #: :attr:`ready` instance is ever assigned to.
     spent: frozenset[str] = frozenset()
+    #: Scratch volumes this fleet owns, for the C5.1 sweep. Empty means "not gathered",
+    #: which is indistinguishable from "none exist" -- and that is safe, because the
+    #: only thing this drives is deletion.
+    volumes: tuple[WorkerVolume, ...] = ()
     #: Ids of instances whose celery worker started and reached the broker (D9).
     #: Consulted when :attr:`Limits.provision_deadline` is set -- see there for why
     #: that switch defaults to off -- **and** whenever :attr:`Limits.assign` is on,
@@ -325,6 +346,23 @@ class FleetState:
     #: and nothing else. See :func:`signals.running_jobs_by_instance`.
     running_jobs: Mapping[str, RunningJob] = field(default_factory=dict)
     now: datetime | None = None
+
+
+@dataclass(frozen=True)
+class WorkerVolume:
+    """One scratch volume this fleet owns, as much of it as the sweep needs.
+
+    Ages rather than timestamps, for the reason :class:`WaitingSubmission` gives:
+    Cinder reports ``created_at`` naive while ``now`` here is tz-aware, so the
+    subtraction happens in :func:`fleet.list_worker_volumes` where that convention is
+    known.
+    """
+
+    id: str
+    #: Whether Cinder reports an attachment. An unattached volume of ours has no worker
+    #: behind it -- either the instance is gone, or it never existed.
+    attached: bool
+    age: timedelta
 
 
 class Create(NamedTuple):
@@ -359,6 +397,10 @@ class Decision:
     #: reachable while targeted assignment is off, i.e. on the shared-queue path.
     create: tuple[Create, ...] = ()
     delete: tuple[str, ...] = ()
+    #: Volume ids to reclaim: ours, unattached, and older than the grace. Separate from
+    #: :attr:`delete` because these are Cinder volumes rather than Nova instances, and
+    #: conflating them would let a volume id reach ``delete_instance``.
+    delete_volumes: tuple[str, ...] = ()
     #: ``(submission id, instance id)`` pairs to bind, oldest submission first (S7).
     #: The caller claims each submission atomically and *then* publishes its chain to
     #: that instance's private queue -- never the reverse order, which can publish the
@@ -540,6 +582,31 @@ def decide(state: FleetState, limits: Limits) -> Decision:
                 "supervisor did not fire",
                 alarming=True,
             )
+
+    # --- orphaned volumes (C5.1) -------------------------------------------
+    # Ours, unattached, and past the grace. Nothing else in the system looks for these:
+    # since C2 the reap path leaves attached volumes to `delete_on_termination`, which
+    # is measured working but has no backstop of its own, and the create path's rollback
+    # only covers a failure it saw happen. A volume orphaned by a controller that died
+    # mid-tick, or by Nova silently not honouring the flag, is invisible until the count
+    # quota -- eight, for this project -- refuses the next create.
+    delete_volumes: list[str] = []
+    if limits.volume_orphan_grace is not None:
+        for vol in state.volumes:
+            if vol.attached or vol.age <= limits.volume_orphan_grace:
+                continue
+            delete_volumes.append(vol.id)
+            # An alert, not an info line. Every one of these is either a leak that
+            # happened or a bug that caused one, and the whole point of the sweep is
+            # that a silent reclaim is indistinguishable from a leak nobody noticed.
+            line = (
+                f"orphaned volume {vol.id}: ours, unattached for {vol.age}, past the "
+                f"{limits.volume_orphan_grace} grace. Reclaiming it. Something failed "
+                "to clean up -- delete_on_termination, or a tick that died between "
+                "creating a volume and creating its instance"
+            )
+            reasons.append(line)
+            alerts.append(line)
 
     # --- assignment (S2) ---------------------------------------------------
     # After the deletes, so a reaped instance is never handed work; before the creates,
@@ -777,6 +844,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     return Decision(
         create=create_sizes,
         delete=tuple(delete),
+        delete_volumes=tuple(delete_volumes),
         assign=tuple(assign),
         reasons=tuple(reasons),
         alerts=tuple(alerts),

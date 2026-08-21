@@ -196,6 +196,15 @@ class Controller:
             queue_depth=signals.queue_depth(self.redis, self.cfg.dispatch_queue),
             serving=signals.serving_count(self.db),
             spent=self._spent(instances),
+            # One Cinder listing per tick, and only when the sweep is armed: a
+            # deployment that never enabled it must not pay a call for a decision it
+            # will not make. Gathered here rather than in the sweep itself so decide()
+            # stays a pure function over one snapshot.
+            volumes=(
+                fleet.list_worker_volumes(self.conn, self.cfg.deployment)
+                if (limits or self.cfg.limits).volume_orphan_grace is not None
+                else ()
+            ),
             # Demand queue_depth cannot see -- a message a worker reserved but cannot
             # start has left the Redis list while being just as unserved -- and, under
             # Limits.assign, the assigner's work list too: one query, so capacity and
@@ -341,6 +350,13 @@ class Controller:
                     volume_id,
                     instance_id,
                 )
+
+        # After the instance deletes, and deliberately not before: a volume whose
+        # instance was just reaped is reclaimed by delete_on_termination, and sweeping
+        # first would race that and log a reclaim for something Nova was handling.
+        # Anything still here next tick is a genuine orphan.
+        for volume_id in decision.delete_volumes:
+            fleet.delete_volume(self.conn, volume_id)
 
         # Assignments before creates: placing work on an instance that already exists is
         # the cheap half, and a create that fails must not stop it. Each binding is

@@ -115,6 +115,15 @@ def build_config() -> Config:
             # permanently holding the rest -- production's 800 GB one is the assetstore.
             max_volumes=(int(v) if (v := _env("SIVACOR_MAX_VOLUMES")) else None),
             max_volume_gb=(int(v) if (v := _env("SIVACOR_MAX_VOLUME_GB")) else None),
+            # C5.1's sweep. Unset = off, and off means nothing looks for a volume
+            # orphaned by a delete_on_termination that did not fire -- since C2 the reap
+            # path deliberately does not check. Minutes, not hours: the count quota is
+            # eight for this whole project.
+            volume_orphan_grace=(
+                timedelta(minutes=float(m))
+                if (m := _env("SIVACOR_VOLUME_ORPHAN_GRACE_MINUTES"))
+                else None
+            ),
         ),
     )
 
@@ -259,6 +268,19 @@ def main() -> int:
         cfg.limits.max_volumes if cfg.limits.max_volumes else "off",
         cfg.limits.max_volume_gb if cfg.limits.max_volume_gb else "off",
     )
+    if cfg.limits.volume_orphan_grace:
+        logging.getLogger(__name__).info(
+            "orphan sweep: an unattached volume of ours older than %s is reclaimed "
+            "(C5.1). This is the only thing that notices a delete_on_termination that "
+            "did not fire",
+            cfg.limits.volume_orphan_grace,
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "orphan sweep is OFF (SIVACOR_VOLUME_ORPHAN_GRACE_MINUTES unset): nothing "
+            "looks for a volume orphaned by a failed delete_on_termination, and the "
+            "project has 10 volumes in total"
+        )
     if cfg.volume_size_gb:
         logging.getLogger(__name__).warning(
             "SIVACOR_VOLUME_SIZE_GB=%s is set but INERT since C3: the size comes from "

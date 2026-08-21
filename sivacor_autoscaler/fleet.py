@@ -13,9 +13,10 @@ import logging
 import re
 import shlex
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .plan import Instance
+from .plan import Instance, WorkerVolume
 
 logger = logging.getLogger(__name__)
 
@@ -232,19 +233,59 @@ def delete_volume(conn, volume_id: str, instance_id: str | None = None) -> None:
     logger.info("deleted volume %s", volume_id)
 
 
-def list_worker_volumes(conn, deployment: str) -> tuple[tuple[str, bool], ...]:
-    """Our scratch volumes as ``((volume_id, is_attached), ...)``.
+def list_worker_volumes(conn, deployment: str, now=None) -> tuple[WorkerVolume, ...]:
+    """Our scratch volumes, with whether each is attached and how old it is.
 
-    The attachment flag is what the C5 sweep needs: an unattached volume of ours has no
-    worker behind it, whether because the instance is gone or because it never
-    existed. Left unused by C2 -- the reap path correlates through the *server*, which
-    is cheaper and exact -- and here so the sweep has something to build on.
+    Drives the C5.1 sweep. The attachment flag is the whole predicate: an unattached
+    volume of ours has no worker behind it, whether because the instance is gone or
+    because it never existed.
+
+    **The age is computed here, not in ``plan``**, for the reason
+    :func:`signals.waiting_submissions` gives about submission ages: Cinder reports
+    ``created_at`` as a naive UTC string while the decision's ``now`` is tz-aware, and
+    the subtraction belongs where that convention is known. Verified against live JS2
+    2026-08-21: the listing carries ``created_at``, ``attachments`` and ``size`` with no
+    details flag, so this is one call.
+
+    Best effort. A listing that raises returns empty, which disables the sweep for that
+    tick rather than failing the round -- the sweep only ever deletes, so seeing nothing
+    is the safe direction.
     """
-    out = []
-    for volume in conn.block_storage.volumes():
+    now = now or datetime.now(tz=timezone.utc)
+    out: list[WorkerVolume] = []
+    try:
+        volumes = list(conn.block_storage.volumes())
+    except Exception:
+        logger.warning(
+            "Could not list volumes; the orphan sweep is skipped this round",
+            exc_info=True,
+        )
+        return ()
+    for volume in volumes:
         if not is_worker_volume(getattr(volume, "name", None), deployment):
             continue
-        out.append((volume.id, bool(getattr(volume, "attachments", None))))
+        created = _parse_time(getattr(volume, "created_at", None))
+        if created is not None and created.tzinfo is None:
+            # **Cinder reports created_at with no timezone at all** --
+            # `2026-08-21T21:57:33.000000`, verified on live JS2 -- where Nova's server
+            # timestamps carry a `Z` that `_parse_time` already handles. So this one
+            # parses NAIVE, and subtracting it from an aware `now` raises TypeError.
+            # Same class of hazard as signals.py's tz_aware note, arriving from the
+            # other service. Assume UTC, which is what Cinder means.
+            created = created.replace(tzinfo=timezone.utc)
+        if created is None:
+            # No age means no way to tell an orphan from a volume created seconds ago,
+            # and the grace is the only thing standing between the sweep and deleting a
+            # volume that is about to be attached. Skip it rather than guess.
+            logger.info("volume %s has no created_at; not sweepable", volume.id)
+            continue
+        out.append(
+            WorkerVolume(
+                id=volume.id,
+                attached=bool(getattr(volume, "attachments", None)),
+                age=now - created,
+            )
+        )
     return tuple(out)
 
 
