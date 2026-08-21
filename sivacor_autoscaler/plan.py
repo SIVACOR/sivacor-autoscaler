@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,20 @@ class Instance:
     #: never mistaken for capacity a large submission could use.
     size: int | None = None
 
+    #: GB of scratch volume attached to this instance, or ``None`` for none.
+    #:
+    #: From the ``sivacor-volume-gb:<n>`` tag written at create time, the same channel
+    #: :attr:`size` uses -- so counting what the fleet holds against the Cinder quota
+    #: costs no API call beyond the server listing this already does. Deriving it from
+    #: Cinder instead would be one extra round trip per tick to learn something the
+    #: controller itself decided.
+    #:
+    #: ``None`` means an instance booted before C3, or one with no volume. Both count
+    #: as zero, which under-counts rather than over-counts: over-counting invents a
+    #: quota wall and stalls submissions, while under-counting merely lets Cinder
+    #: refuse the create, and ``QuotaExceeded`` already treats that as backpressure.
+    volume_gb: int | None = None
+
     @property
     def is_live(self) -> bool:
         """Booting or running, i.e. occupying an instance slot."""
@@ -98,6 +113,14 @@ class WaitingSubmission:
     #: arithmetic uses it only as a stable tiebreaker.
     id: str
     age: timedelta
+
+    #: GB of scratch volume this submission asked for, per ``meta.requested_disk_gb``.
+    #:
+    #: ``None`` means it asked for none, which is every submission on a deployment that
+    #: has not enabled the feature and most submissions on one that has -- the median
+    #: workspace demand measured across the corpus is 1.32 GiB. Distinct from ``0``
+    #: because absent must stay the path with no Cinder call in it.
+    disk_gb: int | None = None
 
     #: Advertised RAM the submission asked for, per ``meta.requested_memory_gb``.
     #:
@@ -246,6 +269,22 @@ class Limits:
     max_vcpus: int | None = None
     max_ram_gb: int | None = None
 
+    #: Cinder volumes and gigabytes this fleet may hold. ``None`` = that check is off,
+    #: which is the pre-C3 behaviour and correct for a deployment with no volumes.
+    #:
+    #: **A third headroom dimension after S6's two, and the tightest of the three.**
+    #: Read live 2026-08-21: the project has 10 volumes / 2000 GB, of which two volumes
+    #: and 1000 GB are the two deployments' own data volumes -- production's 800 GB one
+    #: holds the filesystem assetstore. So the fleet has 8 volumes and 1000 GB, and with
+    #: ``max_instances`` at 5 the **count** binds before the gigabytes do, leaving three
+    #: spare as the entire margin for a leak.
+    #:
+    #: Set them **below** the real quota, for the same reason the other four are: the
+    #: same allocation carries both deployments' data volumes, and deriving these from
+    #: the quota guarantees a collision with the assetstore's ability to grow.
+    max_volumes: int | None = None
+    max_volume_gb: int | None = None
+
 
 @dataclass(frozen=True)
 class FleetState:
@@ -288,9 +327,29 @@ class FleetState:
     now: datetime | None = None
 
 
+class Create(NamedTuple):
+    """One instance to boot: which rung, and how much scratch disk it needs.
+
+    **A pair rather than a bare rung, for the reason P3.1 made it a tuple rather than a
+    count.** That note reads "create 3 no longer says what to create" once the fleet is
+    heterogeneous in memory; it is heterogeneous in *disk* from C3 on, so a rung alone
+    no longer says it either -- and the volume size is exactly what the Cinder headroom
+    arithmetic needs per pending create.
+
+    A ``NamedTuple`` so ``len(decision.create)`` and iteration keep working unchanged;
+    only assertions that compared *contents* had to move.
+
+    ``disk_gb`` is ``None`` for no volume, which is most submissions.
+    """
+
+    rung: int | None
+    disk_gb: int | None = None
+
+
 @dataclass(frozen=True)
 class Decision:
-    #: One entry per instance to boot, each the ``memory_gb`` rung it must be, ordered
+    #: One entry per instance to boot, each a :class:`Create` -- the ``memory_gb`` rung
+    #: it must be and the scratch disk it needs -- ordered
     #: oldest-submission-first (S7). A tuple rather than a count because the fleet is
     #: heterogeneous from P3 on: "create 3" no longer says what to create.
     #:
@@ -298,7 +357,7 @@ class Decision:
     #: -- demand read from queue *depth* rather than from a submission document, which
     #: carries no size. The caller boots its configured default for those. Only
     #: reachable while targeted assignment is off, i.e. on the shared-queue path.
-    create: tuple[int | None, ...] = ()
+    create: tuple[Create, ...] = ()
     delete: tuple[str, ...] = ()
     #: ``(submission id, instance id)`` pairs to bind, oldest submission first (S7).
     #: The caller claims each submission atomically and *then* publishes its chain to
@@ -661,7 +720,12 @@ def decide(state: FleetState, limits: Limits) -> Decision:
         # already ran, so a regression there cannot be P3's. Same reasoning as the phase
         # order itself.
         shortfall = demand - len(available)
-        create_sizes = (None,) * max(0, min(shortfall, headroom))
+        # ``Create(None, None)`` and not a bare ``None``: same meaning as before C3 --
+        # unsized, because depth carries no size, and no disk, because there is no
+        # submission to have asked for one -- but the same type the armed path returns,
+        # so the caller has one shape to consume. The *values* are what the plan means
+        # by this branch being byte-for-byte the pre-P3 arithmetic.
+        create_sizes = (Create(None, None),) * max(0, min(shortfall, headroom))
         # The scalar path can only ever be capped by the instance count.
         stopped_by = "instances" if len(create_sizes) < shortfall else None
     create = len(create_sizes)
@@ -770,14 +834,26 @@ def _spec(limits, rung: int | None) -> SizeSpec | None:
     return None
 
 
-def _quota_used(live, limits) -> tuple[int, int]:
-    """vCPU and RAM (GiB) the live fleet already holds against the quota."""
-    vcpus = ram = 0
+def _quota_used(live, limits) -> tuple[int, int, int, int]:
+    """What the live fleet already holds: vCPU, RAM (GiB), volumes, volume GB.
+
+    All four from the instance listing the caller already has -- the two Cinder figures
+    come from :attr:`Instance.volume_gb`, written as a tag at create time, so this stays
+    a pure function over one snapshot. Asking Cinder instead would be a second source
+    for something this controller decided itself, and two sources that can disagree is
+    the failure S3 exists to avoid.
+    """
+    vcpus = ram = volumes = volume_gb = 0
     for inst in live:
         if spec := _spec(limits, _instance_rung(inst, limits)):
             vcpus += spec.vcpus
             ram += spec.memory_gb
-    return vcpus, ram
+        # Counted off the instance, not the catalogue: the volume size is per
+        # submission from C3 on, so there is no rung to look it up from.
+        if inst.volume_gb:
+            volumes += 1
+            volume_gb += inst.volume_gb
+    return vcpus, ram, volumes, volume_gb
 
 
 def _wanted_rungs(state, limits, available, stalled) -> list[int | None]:
@@ -792,18 +868,26 @@ def _wanted_rungs(state, limits, available, stalled) -> list[int | None]:
     for inst in available:
         rung = _instance_rung(inst, limits)
         pools[rung] = pools.get(rung, 0) + 1
-    out: list[int | None] = []
+    out: list[Create] = []
     for sub in _oldest_first(stalled):
         rung = _submission_rung(sub, limits)
         if pools.get(rung):
             pools[rung] -= 1
         else:
-            out.append(rung)
+            # Matching stays on the RUNG alone, deliberately: an existing instance can
+            # serve this submission only if its memory matches, and its volume is
+            # already sized and mounted. Matching on disk too would refuse a perfectly
+            # good idle worker over a scratch disk nobody has asked to reuse -- and
+            # under S2 every instance serves exactly one submission anyway, so a
+            # mismatched volume cannot be inherited.
+            out.append(Create(rung, sub.disk_gb))
     # Depth beyond what Girder accounts for: messages sitting in the shared queue, which
     # carry no size. Should be zero whenever assignment is armed -- nothing publishes
     # there -- but kept so this path still matches the ``max(depth, len(waiting))``
     # reading above during rollout step 3, and errs towards provisioning.
-    out += [None] * max(0, state.queue_depth - len(stalled))
+    # Depth carries neither size: no rung, and no disk. The caller boots its configured
+    # defaults for both.
+    out += [Create(None, None)] * max(0, state.queue_depth - len(stalled))
     return out
 
 
@@ -824,9 +908,10 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts):
     least debuggable state this design can produce (S7); one waiting behind a quota
     that names the *wrong* limit is worse, because it sends the operator somewhere.
     """
-    used_v, used_r = _quota_used(live, limits)
-    out: list[int | None] = []
-    for rung in wanted:
+    used_v, used_r, used_vol, used_vol_gb = _quota_used(live, limits)
+    out: list[Create] = []
+    for want in wanted:
+        rung = want.rung
         if len(out) >= headroom:
             return tuple(out), "instances"
         spec = _spec(limits, rung)
@@ -843,14 +928,30 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts):
             return tuple(out), "catalogue"
         need_v = spec.vcpus if spec else 0
         need_r = spec.memory_gb if spec else 0
+        need_disk = want.disk_gb or 0
         over = []
         if limits.max_vcpus is not None and used_v + need_v > limits.max_vcpus:
             over.append(f"vCPU {used_v}+{need_v} > {limits.max_vcpus}")
         if limits.max_ram_gb is not None and used_r + need_r > limits.max_ram_gb:
             over.append(f"RAM {used_r}+{need_r} > {limits.max_ram_gb} GB")
+        # Cinder, and only when this create actually wants a volume: a submission
+        # asking for no disk must never be blocked by a volume quota, or the ~90 % of
+        # submissions that want nothing would queue behind the few that do.
+        if need_disk:
+            if limits.max_volumes is not None and used_vol + 1 > limits.max_volumes:
+                over.append(f"volumes {used_vol}+1 > {limits.max_volumes}")
+            if (
+                limits.max_volume_gb is not None
+                and used_vol_gb + need_disk > limits.max_volume_gb
+            ):
+                over.append(
+                    f"volume GB {used_vol_gb}+{need_disk} > {limits.max_volume_gb}"
+                )
         if over:
             line = (
-                f"head of line: a {rung} GB instance does not fit the quota ("
+                f"head of line: a {rung} GB instance"
+                + (f" with a {need_disk} GB volume" if need_disk else "")
+                + " does not fit the quota ("
                 + "; ".join(over)
                 + "), so nothing behind it is created this tick. Strictly oldest-first "
                 "(S7): skipping to a smaller submission that does fit would starve this "
@@ -859,9 +960,12 @@ def _allocate(wanted, live, limits, headroom, reasons, alerts):
             reasons.append(line)
             alerts.append(line)
             return tuple(out), "quota"
-        out.append(rung)
+        out.append(want)
         used_v += need_v
         used_r += need_r
+        if need_disk:
+            used_vol += 1
+            used_vol_gb += need_disk
     return tuple(out), None
 
 

@@ -39,11 +39,16 @@ class _Attachment:
 class _Server:
     """Shaped for the real ``list_fleet``: both tags, or it is invisible."""
 
-    def __init__(self, id, status="ACTIVE", age_minutes=30):
+    def __init__(self, id, status="ACTIVE", age_minutes=30, volume_gb=None):
         self.id = id
         self.name = f"sivacor-worker-{id}"
         self.status = status
         self.tags = [fleet.FLEET_TAG, fleet.deployment_tag(DEPLOYMENT)]
+        # From C3 the reap path keys off what the INSTANCE holds, read from this tag,
+        # rather than off configuration -- so a test about reclaiming has to say the
+        # instance had a volume.
+        if volume_gb:
+            self.tags.append(fleet.volume_gb_tag(volume_gb))
         self.created_at = (NOW - timedelta(minutes=age_minutes)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -191,6 +196,28 @@ class _Redis:
         return None
 
 
+def _decide_to_create(monkeypatch, rung=None, disk_gb=100):
+    """Make ``step`` execute one create of a given shape.
+
+    Stubbing the decision rather than staging a Girder job on purpose: the controller's
+    own docstring says every judgement lives in ``plan.decide`` and this module only
+    does I/O, so a test of the *execution* should not have to reproduce the arithmetic
+    to reach it. The arithmetic has its own tests below, against ``decide`` directly.
+
+    ``rung=None`` by default -- an unsized create, which is what queue depth produces --
+    because these tests are about the volume and a sized rung would need a catalogue
+    loaded to resolve a flavour.
+    """
+    from sivacor_autoscaler import controller as controller_mod
+    from sivacor_autoscaler.plan import Create, Decision
+
+    monkeypatch.setattr(
+        controller_mod,
+        "decide",
+        lambda state, limits: Decision(create=(Create(rung, disk_gb),)),
+    )
+
+
 def _cfg(tmp_path, volume_size_gb=100, **kw):
     template = tmp_path / "cloud-init.sh"
     template.write_text("#!/bin/bash\n" + fleet.INJECT_MARKER + "\necho hi\n")
@@ -275,7 +302,7 @@ def test_no_volume_means_no_variable(tmp_path):
 # --- attachment ------------------------------------------------------------
 
 
-def test_the_volume_rides_along_in_the_build(tmp_path):
+def test_the_volume_rides_along_in_the_build(tmp_path, monkeypatch):
     """Attached by block device mapping, never by a later call.
 
     Nova refuses ``attach_volume`` while the instance is in ``vm_state building``, and
@@ -288,6 +315,7 @@ def test_the_volume_rides_along_in_the_build(tmp_path):
     Nova's default of False -- the C0.2 probe reported it as False on a plain attach.
     """
     cloud = _Cloud()
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
@@ -315,7 +343,7 @@ def test_the_volume_rides_along_in_the_build(tmp_path):
     assert cloud.attachments_made == [], "no separate attach call: Nova would 409"
 
 
-def test_a_block_device_mapping_always_carries_a_boot_entry(tmp_path):
+def test_a_block_device_mapping_always_carries_a_boot_entry(tmp_path, monkeypatch):
     """The invariant, asserted on its own because violating it fails the *create*.
 
     python-openstackclient refuses to send a BDM with no ``boot_index: 0`` entry at
@@ -324,6 +352,7 @@ def test_a_block_device_mapping_always_carries_a_boot_entry(tmp_path):
     with no disk.
     """
     cloud = _Cloud()
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
@@ -332,10 +361,11 @@ def test_a_block_device_mapping_always_carries_a_boot_entry(tmp_path):
     assert sum(1 for e in bdm if e.get("boot_index") == 0) == 1
 
 
-def test_no_block_device_mapping_when_volumes_are_off(tmp_path):
+def test_no_block_device_mapping_when_volumes_are_off(tmp_path, monkeypatch):
     """A create with no volume must be byte-for-byte the pre-C2 call -- an empty BDM
     list is not the same thing to Nova as an absent key."""
     cloud = _Cloud()
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=False), _cfg(tmp_path))
 
     ctl.step()
@@ -346,10 +376,11 @@ def test_no_block_device_mapping_when_volumes_are_off(tmp_path):
 # --- the create path, and its rollbacks -----------------------------------
 
 
-def test_a_worker_gets_a_volume_when_armed(tmp_path):
+def test_a_worker_gets_a_volume_when_armed(tmp_path, monkeypatch):
     """The happy path, in the order that is forced rather than chosen: volume, then
     user-data carrying its id, then instance, then attach."""
     cloud = _Cloud()
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
@@ -379,28 +410,32 @@ def test_no_volume_is_created_while_the_setting_is_off(tmp_path):
     assert len(cloud.created_servers) == 1, "the fleet still boots workers"
 
 
-def test_no_volume_is_created_when_no_size_is_configured(tmp_path):
-    """Two independent switches. Armed in Girder but unsized here is a deployment
-    that has not been told how big, and it must not guess."""
+def test_no_volume_when_the_submission_asked_for_none(tmp_path, monkeypatch):
+    """The C3 semantic, and the one that keeps this feature cheap.
+
+    C2 attached a fixed size to every worker; from C3 the size is the submission's, and
+    a submission that asked for nothing gets **no Cinder call at all**. That is the
+    common case -- the median workspace demand across the corpus is 1.32 GiB -- and it
+    is why handing every production worker 100 GB of a shared 1000 GB quota was never
+    the right shape.
+    """
     cloud = _Cloud()
-    ctl = Controller(
-        cloud,
-        _Redis(),
-        _Girder(volumes_enabled=True),
-        _cfg(tmp_path, volume_size_gb=None),
-    )
+    _decide_to_create(monkeypatch, disk_gb=None)
+    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
 
-    assert cloud.volumes_ == []
-    assert len(cloud.created_servers) == 1
+    assert cloud.volumes_ == [], "asked for nothing, so nothing was created"
+    assert "block_device_mapping" not in cloud.created_servers[0]
+    assert len(cloud.created_servers) == 1, "the worker still boots"
 
 
-def test_a_volume_is_reclaimed_when_the_instance_cannot_be_created(tmp_path):
+def test_a_volume_is_reclaimed_when_the_instance_cannot_be_created(tmp_path, monkeypatch):
     """Otherwise it is an orphan only a sweep could find -- and C5's sweep does not
     exist yet, so this is the only thing standing between a Nova hiccup and a
     permanently held slot out of eight."""
     cloud = _Cloud(server_error=RuntimeError("nova said no"))
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()  # must not raise: step classifies its own failures
@@ -409,12 +444,13 @@ def test_a_volume_is_reclaimed_when_the_instance_cannot_be_created(tmp_path):
     assert cloud.volumes_ == []
 
 
-def test_a_full_cinder_quota_is_backpressure_not_a_breaker_trip(tmp_path):
+def test_a_full_cinder_quota_is_backpressure_not_a_breaker_trip(tmp_path, monkeypatch):
     """The breaker exists to catch a broken image. Letting a full storage allocation
     feed it would stop the whole fleet precisely when it is busiest -- the S6 mistake
     in a new dimension, and the reason ``create_instance`` already treats Nova's
     quota this way."""
     cloud = _Cloud(create_volume_error=fleet.QuotaExceeded("over quota"))
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
@@ -514,7 +550,7 @@ def test_the_reap_path_does_not_try_to_delete_the_volume(tmp_path, caplog):
     """
     caplog.set_level(logging.INFO)
     cloud = _Cloud()
-    cloud.servers_list = [_Server("server-1", status="SHUTOFF")]
+    cloud.servers_list = [_Server("server-1", status="SHUTOFF", volume_gb=100)]
     cloud.volumes_ = [_Volume("vol-7", fleet.volume_name(DEPLOYMENT))]
     ctl = Controller(
         cloud, _Redis(depth=0), _Girder(volumes_enabled=False), _cfg(tmp_path)
@@ -530,13 +566,14 @@ def test_the_reap_path_does_not_try_to_delete_the_volume(tmp_path, caplog):
     assert "rides out with" in caplog.text
 
 
-def test_the_create_rollback_still_deletes_its_volume(tmp_path):
+def test_the_create_rollback_still_deletes_its_volume(tmp_path, monkeypatch):
     """The other caller, which genuinely holds an *unattached* volume.
 
     Dropping the delete from the reap path must not drop it here: this volume's
     instance never existed, so no termination hook can ever reclaim it.
     """
     cloud = _Cloud(server_error=RuntimeError("nova said no"))
+    _decide_to_create(monkeypatch)
     ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
     ctl.step()
@@ -557,7 +594,7 @@ def test_reclaim_is_not_gated_on_the_live_setting(tmp_path, caplog):
     assert my own belief about what ``decide`` returns for a SHUTOFF instance.
     """
     cloud = _Cloud()
-    cloud.servers_list = [_Server("server-1", status="SHUTOFF")]
+    cloud.servers_list = [_Server("server-1", status="SHUTOFF", volume_gb=100)]
     cloud.volumes_ = [_Volume("vol-7", fleet.volume_name(DEPLOYMENT))]
     # Setting OFF, size still configured: the state right after a disarm.
     ctl = Controller(
@@ -598,3 +635,166 @@ def test_a_deployment_with_no_volumes_configured_pays_no_call(tmp_path):
 
     assert cloud.deleted_servers == ["server-1"]
     assert calls == []
+
+
+# --- C3: Cinder as a third headroom dimension ------------------------------
+#
+# Against `decide` directly, per the plan's pure-function-first rule: with no volume
+# limits configured this arithmetic must be byte-for-byte what it was, and the
+# interesting cases are the stops -- a submission blocked by volumes or gigabytes must
+# say WHICH, because S7 calls a submission waiting behind a quota it cannot name the
+# least debuggable state this design can produce, and one naming the wrong limit worse.
+
+from datetime import timedelta as _td
+
+from sivacor_autoscaler.plan import (
+    FleetState,
+    Instance,
+    SizeSpec,
+    WaitingSubmission,
+    decide,
+)
+
+LADDER = (SizeSpec(memory_gb=30, vcpus=8), SizeSpec(memory_gb=60, vcpus=16))
+
+
+def _waiting(n, disk_gb, memory_gb=30):
+    return tuple(
+        WaitingSubmission(
+            id=f"sub-{i}",
+            age=_td(minutes=10 - i),
+            assignable=True,
+            memory_gb=memory_gb,
+            disk_gb=disk_gb,
+        )
+        for i in range(n)
+    )
+
+
+def _armed(**kw):
+    base = {"assign": True, "sizes": LADDER, "max_instances": 5}
+    base.update(kw)
+    return Limits(**base)
+
+
+def _state(waiting=(), instances=(), spent=()):
+    """``spent`` matters: an instance that is idle and matching gets ASSIGNED the
+    waiting submission rather than provoking a create, so a test that wants an
+    instance merely *holding quota* has to say it is already serving something."""
+    return FleetState(
+        queue_depth=0, serving=0, waiting=waiting, instances=instances, now=NOW,
+        ready=frozenset(i.id for i in instances),
+        spent=frozenset(spent),
+    )
+
+
+def test_the_disk_a_submission_asked_for_reaches_the_create():
+    """C1 has recorded this since before anything could act on it."""
+    d = decide(_state(waiting=_waiting(1, disk_gb=200)), _armed())
+
+    assert [(c.rung, c.disk_gb) for c in d.create] == [(30, 200)]
+
+
+def test_a_submission_that_asked_for_nothing_creates_no_volume():
+    d = decide(_state(waiting=_waiting(1, disk_gb=None)), _armed())
+
+    assert [(c.rung, c.disk_gb) for c in d.create] == [(30, None)]
+
+
+def test_with_no_volume_limits_the_arithmetic_is_unchanged():
+    """Production's branch until someone configures these, so it must not move."""
+    waiting = _waiting(4, disk_gb=500)
+    unlimited = decide(_state(waiting=waiting), _armed())
+
+    assert len(unlimited.create) == 4, "no volume cap means volumes never block"
+    assert not any("volume" in r for r in unlimited.reasons)
+
+
+def test_the_volume_count_can_bind_before_the_instance_count():
+    """The tighter of the two Cinder limits at this fleet's scale: 8 spare volumes
+    against 5 instances means the count binds first only when it is set lower."""
+    d = decide(_state(waiting=_waiting(3, disk_gb=10)), _armed(max_volumes=2))
+
+    assert len(d.create) == 2
+    assert any("volumes 2+1 > 2" in r for r in d.reasons), d.reasons
+
+
+def test_gigabytes_can_bind_before_the_count():
+    d = decide(_state(waiting=_waiting(3, disk_gb=400)), _armed(max_volume_gb=1000))
+
+    assert len(d.create) == 2, "two 400 GB volumes fit in 1000, the third does not"
+    assert any("volume GB 800+400 > 1000" in r for r in d.reasons), d.reasons
+
+
+def test_a_volume_stop_names_volumes_rather_than_max_instances():
+    """The `CAPPED` misattribution, in the new dimension.
+
+    On 2026-08-20 a quota stop was reported as `max_instances=5`, sending the operator
+    to raise a number that would change nothing. A volume stop must say volumes.
+    """
+    d = decide(_state(waiting=_waiting(2, disk_gb=10)), _armed(max_volumes=1))
+
+    blocked = [r for r in d.reasons if "head of line" in r]
+    assert blocked, d.reasons
+    assert "volumes" in blocked[0]
+    assert "max_instances" not in blocked[0]
+    assert d.stopped_by == "quota" if hasattr(d, "stopped_by") else True
+
+
+def test_the_head_of_line_message_names_the_disk_it_could_not_fit():
+    d = decide(_state(waiting=_waiting(2, disk_gb=900)), _armed(max_volume_gb=1000))
+
+    blocked = [r for r in d.reasons if "head of line" in r]
+    assert "900 GB volume" in blocked[0], blocked
+
+
+def test_a_submission_wanting_no_disk_is_never_blocked_by_a_volume_quota():
+    """The ~90 % case must not queue behind the few that want disk.
+
+    A full volume quota with nothing left would otherwise stall every ordinary
+    submission on a deployment that had enabled the feature at all.
+    """
+    holding = (
+        Instance(id="i1", name="w1", status="ACTIVE", size=30, volume_gb=1000,
+                 created_at=NOW - _td(minutes=5)),
+    )
+    d = decide(
+        _state(waiting=_waiting(2, disk_gb=None), instances=holding, spent=("i1",)),
+        _armed(max_volume_gb=1000, max_volumes=1),
+    )
+
+    assert len(d.create) == 2, "no disk asked for, so the Cinder quota is irrelevant"
+
+
+def test_a_volume_quota_stop_recovers_when_the_volume_comes_back():
+    """The half that matters. A quota stop that never releases is indistinguishable
+    from a stalled controller for the first twenty minutes."""
+    holding = (
+        Instance(id="i1", name="w1", status="ACTIVE", size=30, volume_gb=900,
+                 created_at=NOW - _td(minutes=5)),
+    )
+    limits = _armed(max_volume_gb=1000)
+
+    blocked = decide(
+        _state(waiting=_waiting(1, disk_gb=500), instances=holding, spent=("i1",)), limits
+    )
+    assert blocked.create == (), "900 held + 500 wanted does not fit 1000"
+
+    # ...the holder is reaped, its volume goes with it, and the next tick proceeds.
+    freed = decide(_state(waiting=_waiting(1, disk_gb=500)), limits)
+    assert len(freed.create) == 1, "the stop must release, not latch"
+
+
+def test_an_instance_with_no_volume_tag_counts_as_zero():
+    """Under-counts rather than over-counts: an instance booted before C3 has no tag,
+    and inventing usage for it would build a quota wall out of nothing."""
+    old = (
+        Instance(id="i1", name="w1", status="ACTIVE", size=30,
+                 created_at=NOW - _td(minutes=5)),
+    )
+    d = decide(
+        _state(waiting=_waiting(1, disk_gb=1000), instances=old, spent=("i1",)),
+        _armed(max_volume_gb=1000),
+    )
+
+    assert len(d.create) == 1

@@ -76,6 +76,37 @@ def size_tag(memory_gb: int) -> str:
     return f"{SIZE_TAG_PREFIX}{memory_gb}"
 
 
+#: How much scratch disk an instance holds, as a tag: ``sivacor-volume-gb:100``.
+#:
+#: A *fourth* tag, and safe for the same reason the third was: :func:`list_fleet`
+#: filters on tag **subset**, requiring only :data:`FLEET_TAG` and the deployment tag,
+#: so instances predating this carry three and match exactly as before.
+#:
+#: Tagged rather than read from Cinder because the controller decided this number --
+#: asking Cinder would be a second source for it, one round trip per tick, and two
+#: sources that can disagree. It is what lets ``plan._quota_used`` count Cinder headroom
+#: from the server listing it already has.
+VOLUME_GB_TAG_PREFIX = "sivacor-volume-gb:"
+
+
+def volume_gb_tag(gb: int) -> str:
+    return f"{VOLUME_GB_TAG_PREFIX}{gb}"
+
+
+def _volume_gb_from(tags) -> int | None:
+    """The scratch-disk size an instance's tags declare, or ``None``."""
+    for tag in tags:
+        if tag.startswith(VOLUME_GB_TAG_PREFIX):
+            try:
+                return int(tag[len(VOLUME_GB_TAG_PREFIX) :])
+            except ValueError:
+                # A malformed tag reads as "no volume", which under-counts against the
+                # quota rather than inventing a wall -- the same direction
+                # Instance.volume_gb documents.
+                return None
+    return None
+
+
 #: Marks a Cinder volume as this fleet's: ``sivacor-worker-volume:<deployment>:<hex>``.
 #:
 #: **A volume outside this naming is invisible to its own controller** -- never
@@ -400,6 +431,7 @@ def list_fleet(
                 # size tag is the primary source anyway -- a missing flavour here costs
                 # a fallback, not a listing.
                 size=_size_from(tags, _flavor_name(s), flavor_sizes),
+                volume_gb=_volume_gb_from(tags),
             )
         )
     return tuple(out)
@@ -412,6 +444,7 @@ def create_instance(
     flavor: str | None = None,
     size: int | None = None,
     volume_id: str | None = None,
+    volume_gb: int | None = None,
 ) -> str:
     """Boot one worker. Returns its id.
 
@@ -462,7 +495,10 @@ def create_instance(
         # only FLEET_TAG would be invisible to its own controller: never counted, never
         # reaped, and holding a quota slot until a human noticed.
         "tags": [FLEET_TAG, deployment_tag(cfg.deployment)]
-        + ([size_tag(size)] if size is not None else []),
+        + ([size_tag(size)] if size is not None else [])
+        # So the next tick can count this instance's Cinder usage from the server
+        # listing alone. Absent when there is no volume, which is most instances.
+        + ([volume_gb_tag(volume_gb)] if volume_gb else []),
         # Metadata rather than tags for the human-facing copy: `openstack server show`
         # prints properties in full, which is where anyone debugging looks first.
         "metadata": {
@@ -470,6 +506,7 @@ def create_instance(
             "sivacor_deployment": cfg.deployment,
             "sivacor_flavor": want_flavor,
             **({"sivacor_size_gb": str(size)} if size is not None else {}),
+            **({"sivacor_volume_gb": str(volume_gb)} if volume_gb else {}),
         },
     }
     if volume_id:

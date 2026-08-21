@@ -14,7 +14,7 @@ import pytest
 
 from sivacor_autoscaler import controller as controller_mod
 from sivacor_autoscaler.controller import Config, Controller
-from sivacor_autoscaler.plan import Decision, FleetState, Instance, Limits
+from sivacor_autoscaler.plan import Create, Decision, FleetState, Instance, Limits
 
 NOW = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc)
 
@@ -156,7 +156,7 @@ def _armed(monkeypatch, ctl, conn):
     monkeypatch.setattr(controller_mod.fleet, "build_user_data", lambda *a, **k: "#!/bin/bash\n")
 
     def create_instance(
-        _conn, _cfg, _user_data, flavor=None, size=None, volume_id=None
+        _conn, _cfg, _user_data, flavor=None, size=None, volume_id=None, volume_gb=None
     ):
         conn.creates += 1
         if conn.fail:
@@ -165,7 +165,14 @@ def _armed(monkeypatch, ctl, conn):
 
     monkeypatch.setattr(controller_mod.fleet, "create_instance", create_instance)
     # decide() is not under test here; drive the create loop directly.
-    monkeypatch.setattr(controller_mod, "decide", lambda state, limits: Decision(create=(None,)))
+    # Create(None, None) rather than a bare None: unsized and no disk, which is what
+    # queue depth produces -- the same values as before C3, in the shape decide now
+    # returns so the caller has one thing to consume.
+    monkeypatch.setattr(
+        controller_mod,
+        "decide",
+        lambda state, limits: Decision(create=(Create(None, None),)),
+    )
     monkeypatch.setattr(
         ctl, "gather", lambda limits=None: FleetState(queue_depth=1, serving=0, now=NOW)
     )

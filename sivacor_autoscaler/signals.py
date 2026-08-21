@@ -361,6 +361,10 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
                     # already runs -- the whole point of demand and placement being one
                     # query is that adding a dimension costs nothing here.
                     "meta.requested_memory_gb": 1,
+                    # C3 reads the disk the same way P3 read the memory: one more
+                    # projection field on a query that already runs. C1 has been
+                    # recording it since before anything could act on it.
+                    "meta.requested_disk_gb": 1,
                 },
             )
             # Oldest first, and the direction is load-bearing now that this is the
@@ -389,6 +393,7 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
             created = created.replace(tzinfo=timezone.utc)
         meta = job.get("meta") or {}
         requested = meta.get("requested_memory_gb")
+        disk = meta.get("requested_disk_gb")
         out.append(
             WaitingSubmission(
                 id=str(job.get("_id")),
@@ -402,6 +407,11 @@ def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
                 # cheapest rung is only knowable from the catalogue, which this module
                 # deliberately does not read.
                 memory_gb=int(requested) if isinstance(requested, (int, float)) else None,
+                # None means the submission asked for no scratch volume, which is the
+                # overwhelming majority: absent and zero both mean "no volume", and
+                # neither is defaulted to a configured size -- C3's whole point is that
+                # the figure comes from the request rather than from configuration.
+                disk_gb=int(disk) if isinstance(disk, (int, float)) and disk else None,
             )
         )
     if out:

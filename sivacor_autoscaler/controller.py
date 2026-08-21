@@ -279,7 +279,7 @@ class Controller:
         by_id = {i.id: i for i in state.instances}
         # Read once per tick, like the arm flag: two creates in one round must not
         # disagree about whether this deployment attaches volumes.
-        volumes_on = bool(self.cfg.volume_size_gb) and signals.volumes_enabled(self.db)
+        volumes_on = signals.volumes_enabled(self.db)
 
         # Deletes first: they free slots the creates may want, and they must happen
         # even when the breaker has blocked creation.
@@ -305,9 +305,14 @@ class Controller:
             # have volumes, so it still pays no call. (Unsetting the size entirely while
             # instances hold volumes does leak here -- which is what
             # delete_on_termination is the backstop for.)
+            # Keyed off what the INSTANCE holds, not off configuration and not off
+            # this tick's flag. An instance booted while armed still has a volume after
+            # a disarm, and a deployment that never used the feature has instances with
+            # no volume tag -- so this pays no call for them either. `volume_gb` comes
+            # from the tag written at create time.
             volumes = (
                 fleet.volumes_attached_to(self.conn, instance_id)
-                if self.cfg.volume_size_gb
+                if (by_id.get(instance_id) and by_id[instance_id].volume_gb)
                 else ()
             )
             try:
@@ -356,7 +361,8 @@ class Controller:
                     exc_info=True,
                 )
 
-        for rung in decision.create:
+        for want in decision.create:
+            rung = want.rung
             try:
                 # `rung` is the catalogue size this instance must be, or None for
                 # "unsized" -- demand read from queue depth, which carries no size, and
@@ -369,9 +375,21 @@ class Controller:
                 # That is also V4's ordering, and it fails toward the recoverable side:
                 # a volume with no instance is reclaimable, a worker with no volume
                 # runs the submission on the root disk this plan exists to escape.
+                # **The size comes from the submission, not from configuration.**
+                # C2 attached one fixed figure to every worker; from C3 the volume is
+                # the one that submission asked for, and a submission that asked for
+                # nothing gets no volume at all -- which is most of them, since the
+                # median workspace demand across the corpus is 1.32 GiB. Handing 100 GB
+                # to every worker on production would spend a shared quota the
+                # assetstore draws on to benefit roughly a tenth of runs.
+                #
+                # ``want.disk_gb`` is None on the unarmed path too: demand read from
+                # queue depth has no submission behind it, so there is nothing to
+                # honour. Volumes therefore require targeted assignment, which V4
+                # already states.
                 volume_id = (
-                    fleet.create_volume(self.conn, self.cfg, self.cfg.volume_size_gb)
-                    if volumes_on
+                    fleet.create_volume(self.conn, self.cfg, want.disk_gb)
+                    if volumes_on and want.disk_gb
                     else None
                 )
                 user_data = fleet.build_user_data(
@@ -397,6 +415,7 @@ class Controller:
                         flavor=want_flavor,
                         size=rung,
                         volume_id=volume_id,
+                        volume_gb=want.disk_gb if volume_id else None,
                     )
                 except Exception:
                     # Reclaim before re-raising, or the volume becomes an orphan only

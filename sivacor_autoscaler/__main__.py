@@ -71,17 +71,17 @@ def build_config() -> Config:
         diagnostics_dir=(
             Path(d) if (d := _env("SIVACOR_DIAGNOSTICS_DIR")) else None
         ),
-        # Unset = no scratch volume, and every Cinder code path stays unreached.
-        # C2 of cinder_volumes_plan.md: ONE fixed size for every worker, not the size
-        # a submission asked for -- that is C3. The *arming* decision is the Girder
-        # setting `sivacor.volumes_enabled`, read per tick, because Girder and this
-        # process both have to agree about it; this variable only says how big.
+        # **Inert since C3, and kept only so a stale .env cannot change behaviour.**
+        # C2 used this as the size every worker got; C3 takes the size from the
+        # submission's own `meta.requested_disk_gb`, so a submission that asked for
+        # nothing now gets no volume -- which is most of them, the median workspace
+        # demand across the corpus being 1.32 GiB. Whether volumes are created at all
+        # is the Girder setting `sivacor.volumes_enabled`, read per tick because
+        # submit_job gates on the same document.
         #
-        # Set it far below the Cinder quota. Live 2026-08-21: 10 volumes / 2000 GB for
-        # the project, of which two volumes and 1000 GB are the two deployments' own
-        # data volumes -- production's 800 GB one holds the assetstore. So the fleet
-        # has 8 volumes and 1000 GB, and with max_instances=5 the *count* is the
-        # tighter limit, leaving three spare as the entire margin for a leak.
+        # Not deleted outright: a deployment whose .env still sets it must not silently
+        # change shape on the next pull, and reading-and-ignoring is louder than a
+        # KeyError nobody sees. Remove it once no .env carries it.
         volume_size_gb=(int(v) if (v := _env("SIVACOR_VOLUME_SIZE_GB")) else None),
         limits=Limits(
             max_instances=int(_env("SIVACOR_MAX_INSTANCES", "5")),
@@ -107,6 +107,14 @@ def build_config() -> Config:
             # the two managers.
             max_vcpus=(int(v) if (v := _env("SIVACOR_MAX_VCPUS")) else None),
             max_ram_gb=(int(v) if (v := _env("SIVACOR_MAX_RAM_GB")) else None),
+            # S6's dimensions, plus Cinder's two from C3. Unset = off, which is the
+            # pre-C3 behaviour and correct for a deployment with no volumes.
+            #
+            # The tightest of the five at this fleet's scale: 8 spare volumes and
+            # 1000 GB against max_instances=5, with the two deployments' data volumes
+            # permanently holding the rest -- production's 800 GB one is the assetstore.
+            max_volumes=(int(v) if (v := _env("SIVACOR_MAX_VOLUMES")) else None),
+            max_volume_gb=(int(v) if (v := _env("SIVACOR_MAX_VOLUME_GB")) else None),
         ),
     )
 
@@ -241,16 +249,21 @@ def main() -> int:
     # Same family as the quota-headroom line below: `SIVACOR_MAX_VCPUS=8` reached the
     # container on 2026-08-20 and nothing in the log said so, which is provable only
     # with `docker exec ... env`. Say what this process believes about volumes.
+    logging.getLogger(__name__).info(
+        "scratch volumes: per submission (meta.requested_disk_gb), __DEFAULT__ type, "
+        "armed by the Girder setting sivacor.volumes_enabled -- read per tick, so this "
+        "line cannot tell you whether it is ON; the controller logs that on each flip. "
+        "Cinder headroom: max_volumes=%s, max_volume_gb=%s (C3). Project quota is 10 "
+        "volumes / 2000 GB, two volumes and 1000 GB of it permanently the two "
+        "deployments' data volumes",
+        cfg.limits.max_volumes if cfg.limits.max_volumes else "off",
+        cfg.limits.max_volume_gb if cfg.limits.max_volume_gb else "off",
+    )
     if cfg.volume_size_gb:
-        logging.getLogger(__name__).info(
-            "scratch volumes: %d GB per worker, __DEFAULT__ type, armed by the Girder "
-            "setting sivacor.volumes_enabled (C2). Cinder quota is 10 volumes / "
-            "2000 GB for the project, two volumes and 1000 GB of it permanent",
+        logging.getLogger(__name__).warning(
+            "SIVACOR_VOLUME_SIZE_GB=%s is set but INERT since C3: the size comes from "
+            "each submission's meta.requested_disk_gb. Remove it from .env",
             cfg.volume_size_gb,
-        )
-    else:
-        logging.getLogger(__name__).info(
-            "scratch volumes: off (SIVACOR_VOLUME_SIZE_GB unset)"
         )
 
     # Sixth of the same family, and the one that fails latest if left unsaid. Once
@@ -324,7 +337,9 @@ def main() -> int:
         for reason in decision.reasons:
             print(f"  {reason}")
         shapes = ", ".join(
-            f"{r} GB" if r is not None else "unsized" for r in decision.create
+            (f"{c.rung} GB" if c.rung is not None else "unsized")
+            + (f"+{c.disk_gb} GB disk" if c.disk_gb else "")
+            for c in decision.create
         )
         print(
             f"would create {len(decision.create)}"

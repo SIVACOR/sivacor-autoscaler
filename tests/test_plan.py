@@ -85,6 +85,17 @@ def waiting(*ages, ids=None, assignable=True, sizes=None):
 D9 = Limits(provision_deadline=timedelta(minutes=10))
 
 
+def rungs(decision):
+    """The memory rungs of a decision's creates, which is what most of these assert.
+
+    ``Decision.create`` became a tuple of :class:`Create` pairs in C3, since a rung
+    alone no longer says what to boot once volumes are per-submission. These assertions
+    were always about rungs, so they stay about rungs; the disk half has its own tests
+    in ``test_volume_headroom``.
+    """
+    return tuple(c.rung for c in decision.create)
+
+
 def test_scale_from_zero():
     d = decide(state(depth=3), LIMITS)
     assert len(d.create) == 3
@@ -868,7 +879,7 @@ def test_an_instance_of_the_wrong_size_is_not_capacity():
         ),
         SIZED,
     )
-    assert d.create == (60, 60)
+    assert rungs(d) == (60, 60)
     assert d.assign == (), "a 30 GB instance must never take a 60 GB submission"
 
 
@@ -903,7 +914,7 @@ def test_assignment_stops_at_the_head_of_the_line_rather_than_skipping():
     assert any("head of line" in r for r in d.reasons)
     assert any("head of line" in a for a in d.alerts), "a blocked head is an anomaly"
     # ...and the fleet still fixes it: an instance of the shape it wants is created.
-    assert 60 in d.create
+    assert 60 in rungs(d)
 
 
 def test_the_vcpu_quota_binds_before_the_instance_count():
@@ -962,7 +973,7 @@ def test_a_create_that_will_not_fit_stops_the_ones_behind_it():
         ),
         limits,
     )
-    assert d.create == (60, 60)
+    assert rungs(d) == (60, 60)
     assert any("does not fit the quota" in a for a in d.alerts)
 
 
@@ -974,14 +985,14 @@ def test_a_size_that_left_the_catalogue_is_visible_not_silently_downgraded():
     `sivacor.assignment_timeout` as `reaped_no_worker` -- which points at the fleet.
     """
     d = decide(state(waiting=waiting(MIN * 3, sizes=[125])), SIZED)
-    assert d.create == ()
+    assert rungs(d) == ()
     assert any("not in the catalogue" in a for a in d.alerts)
 
 
 def test_an_unsized_submission_gets_the_cheapest_rung():
     """Pre-P1 submissions have no `requested_memory_gb`, and guessing up costs money."""
     d = decide(state(waiting=waiting(MIN * 3)), SIZED)
-    assert d.create == (30,)
+    assert rungs(d) == (30,)
 
 
 def test_an_untagged_instance_counts_as_the_cheapest_rung():
@@ -996,7 +1007,7 @@ def test_an_untagged_instance_counts_as_the_cheapest_rung():
         SIZED,
     )
     assert d.assign == (("sub-0", "id-legacy"),), "matched to the smallest rung"
-    assert d.create == ()
+    assert rungs(d) == ()
 
 
 def test_unarmed_keeps_the_scalar_arithmetic_even_with_a_catalogue():
@@ -1017,18 +1028,18 @@ def test_unarmed_keeps_the_scalar_arithmetic_even_with_a_catalogue():
         waiting=waiting(timedelta(minutes=5), sizes=[60]),
     )
     unarmed = decide(s, Limits(max_instances=5, sizes=LADDER))
-    assert unarmed.create == (), "an available worker will take it off the shared queue"
+    assert rungs(unarmed) == (), "an available worker will take it off the shared queue"
     assert unarmed.assign == (), "unarmed, this controller places nothing"
 
     # Armed, the same state is a real shortfall: nothing will hand that message to the
     # 30 GB box, and the 60 GB submission needs hardware that does not exist yet.
-    assert decide(s, replace(SIZED, max_instances=5)).create == (60,)
+    assert rungs(decide(s, replace(SIZED, max_instances=5))) == (60,)
 
 
 def test_unarmed_creates_are_unsized():
     """Demand from queue depth carries no size, so the caller boots its own default."""
     d = decide(state(depth=2), Limits(max_instances=5, sizes=LADDER))
-    assert d.create == (None, None)
+    assert rungs(d) == (None, None)
 
 
 def test_a_quota_stop_does_not_blame_the_instance_cap():
@@ -1053,7 +1064,7 @@ def test_a_quota_stop_does_not_blame_the_instance_cap():
         limits,
     )
 
-    assert d.create == (), "24 vCPU are already held; nothing fits"
+    assert rungs(d) == (), "24 vCPU are already held; nothing fits"
     assert any("does not fit the quota" in a for a in d.alerts)
     assert any("vCPU 24+8 > 8" in a for a in d.alerts), "name the real arithmetic"
     # The point of the fix:
