@@ -151,27 +151,6 @@ def create_volume(conn, cfg, size_gb: int) -> str:
     return volume.id
 
 
-def attach_volume(conn, instance_id: str, volume_id: str) -> None:
-    """Attach ``volume_id`` to ``instance_id``, set to die with it.
-
-    ``delete_on_termination`` is belt and braces over the explicit detach-and-delete in
-    the reap path, and it is not optional. The controller can die between deleting a
-    server and deleting its volume -- a crash, a restart, a ``docker service update``
-    -- and that window exists on every deploy. Nova then reclaims the volume without
-    anyone noticing, which is the difference between a leak and no leak on an unclean
-    restart. **It is not the default**: the C0.2 probe attached a volume and Nova
-    reported ``Delete On Termination: False``.
-    """
-    conn.compute.create_volume_attachment(
-        server=instance_id,
-        volumeId=volume_id,
-        delete_on_termination=True,
-    )
-    logger.info(
-        "attached volume %s to %s (delete_on_termination)", volume_id, instance_id
-    )
-
-
 def delete_volume(conn, volume_id: str, instance_id: str | None = None) -> None:
     """Detach if attached, then delete. Best effort, and says so when it fails.
 
@@ -182,8 +161,13 @@ def delete_volume(conn, volume_id: str, instance_id: str | None = None) -> None:
     """
     if instance_id:
         try:
+            # (server, volume) -- in that order. Passing them the other way round
+            # raises `got multiple values for argument 'server'`, which happened on the
+            # mirror 2026-08-21 and was *masked* by the except below: the delete still
+            # ran, so the volume was reclaimed and only the logged traceback showed the
+            # call had never worked.
             conn.compute.delete_volume_attachment(
-                volume_id, server=instance_id, ignore_missing=True
+                instance_id, volume_id, ignore_missing=True
             )
         except Exception:
             # An already-detached volume, or a server Nova has forgotten. Either way
@@ -414,7 +398,12 @@ def list_fleet(
 
 
 def create_instance(
-    conn, cfg, user_data: str, flavor: str | None = None, size: int | None = None
+    conn,
+    cfg,
+    user_data: str,
+    flavor: str | None = None,
+    size: int | None = None,
+    volume_id: str | None = None,
 ) -> str:
     """Boot one worker. Returns its id.
 
@@ -472,6 +461,33 @@ def create_instance(
             **({"sivacor_size_gb": str(size)} if size is not None else {}),
         },
     }
+    if volume_id:
+        # Attached as part of the BUILD, not by a later call. `create_volume_attachment`
+        # cannot work here: Nova refuses it with 409 `Cannot 'attach_volume' ... while
+        # it is in vm_state building`, and `create_server` returns while the instance is
+        # still building -- so a separate attach fails every single time. Observed on
+        # the mirror 2026-08-21, 17 ms after the create.
+        #
+        # Waiting for ACTIVE inside the tick was the obvious alternative and is worse:
+        # a 30 s control loop would block for the ~60-120 s of a boot, stalling every
+        # reap and assignment behind it. Attaching on a *later* tick would work but adds
+        # cross-tick state, and it would race cloud-init -- the boot block waits 60 s
+        # for its device, and a disk that arrives after that window makes the worker
+        # exit rather than run.
+        #
+        # boot_index -1 means "attach, do not boot from this": the root disk still comes
+        # from `image_id` above. delete_on_termination lives here rather than on a
+        # separate attachment call, which is also how it stops being Nova's default of
+        # False -- see the C0.2 probe.
+        kwargs["block_device_mapping"] = [
+            {
+                "uuid": volume_id,
+                "source_type": "volume",
+                "destination_type": "volume",
+                "delete_on_termination": True,
+                "boot_index": -1,
+            }
+        ]
     if cfg.key_name:
         kwargs["key_name"] = cfg.key_name
     if cfg.security_groups:

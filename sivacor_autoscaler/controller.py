@@ -370,17 +370,26 @@ class Controller:
                     volume_id=volume_id,
                 )
                 try:
-                    instance_id = fleet.create_instance(
-                        self.conn, self.cfg, user_data, flavor=want_flavor, size=rung
+                    # The volume rides along in the BUILD rather than being attached
+                    # afterwards: Nova refuses an attach while the instance is still
+                    # building, so a separate call fails every time. See
+                    # fleet.create_instance.
+                    fleet.create_instance(
+                        self.conn,
+                        self.cfg,
+                        user_data,
+                        flavor=want_flavor,
+                        size=rung,
+                        volume_id=volume_id,
                     )
                 except Exception:
                     # Reclaim before re-raising, or the volume becomes an orphan only
-                    # the C5 sweep could find -- and C5 does not exist yet.
+                    # the C5 sweep could find -- and C5 does not exist yet. This is now
+                    # the ONLY rollback in the create path, because attaching is no
+                    # longer a step that can fail on its own.
                     if volume_id:
                         fleet.delete_volume(self.conn, volume_id)
                     raise
-                if volume_id:
-                    self._attach_or_discard(instance_id, volume_id)
                 # A create that works is the only positive evidence that whatever
                 # tripped the breaker is over. Nothing else cleared this counter
                 # before 2026-08-12.
@@ -401,38 +410,6 @@ class Controller:
                     exc_info=True,
                 )
                 break
-
-    def _attach_or_discard(self, instance_id: str, volume_id: str) -> None:
-        """Attach the volume, or throw away both halves.
-
-        **Discarding the instance is the point of this method.** A worker holding an
-        unattached volume boots without it, runs its submission on the plain 60 GB root
-        disk, and fails exactly the way this plan exists to prevent -- while having
-        consumed a volume from a quota of eight. Since C0 that failure is at least
-        *attributable* (it records ``out_of_disk`` rather than ``image_pull_failed``),
-        but attributable is not acceptable: the submission still dies after waiting for
-        a boot, and the boot block would have refused to start anyway, because it exits
-        non-zero rather than guessing a device.
-
-        So both go back and the submission stays queued for the next tick. One wasted
-        boot against a silent breach of what the fleet promised.
-
-        Order matters: the **volume first**. Once the instance is gone
-        ``volumes_attached_to`` can no longer find the volume, and only a sweep would.
-        """
-        try:
-            fleet.attach_volume(self.conn, instance_id, volume_id)
-        except Exception:
-            logger.warning(
-                "could not attach volume %s to %s; discarding both and leaving the "
-                "submission queued",
-                volume_id,
-                instance_id,
-                exc_info=True,
-            )
-            fleet.delete_volume(self.conn, volume_id, instance_id=instance_id)
-            fleet.delete_instance(self.conn, instance_id)
-            raise
 
     def run(self) -> None:
         logger.info(

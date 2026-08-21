@@ -87,16 +87,31 @@ class _Cloud:
         self.created_servers.append(kwargs)
         return _Volume("server-1", kwargs.get("name"))
 
+    def _reject_attach_while_building(self, *a, **kw):
+        """What Nova really does, and what the unit tests originally did not.
+
+        409 ``Cannot 'attach_volume' ... while it is in vm_state building``. Every
+        create failed this way on the mirror 2026-08-21, and no test caught it because
+        the fake accepted an attach at any time. It is here so nothing reintroduces a
+        post-create attach.
+        """
+        raise RuntimeError(
+            "ConflictException: 409: Cannot 'attach_volume' instance while it is in "
+            "vm_state building"
+        )
+
     def delete_server(self, instance_id, ignore_missing=True):
         self.deleted_servers.append(instance_id)
 
-    def create_volume_attachment(self, server, volumeId, **kwargs):
-        if self._attach_error:
-            raise self._attach_error
-        self.attachments_made.append((server, volumeId, kwargs))
+    def create_volume_attachment(self, server, volume=None, **kwargs):
+        # Nothing should reach this any more: the volume rides along in the build.
+        self.attachments_made.append((server, volume, kwargs))
+        self._reject_attach_while_building()
 
-    def delete_volume_attachment(self, volume_id, server, ignore_missing=True):
-        self.detached.append((volume_id, server))
+    def delete_volume_attachment(self, server, volume, ignore_missing=True):
+        # (server, volume), matching openstacksdk. The reversed call raised
+        # `got multiple values for argument 'server'` on the mirror.
+        self.detached.append((server, volume))
 
     def volume_attachments(self, instance_id):
         return [_Attachment(v.id) for v in self.volumes_]
@@ -259,18 +274,42 @@ def test_no_volume_means_no_variable(tmp_path):
 # --- attachment ------------------------------------------------------------
 
 
-def test_an_attachment_is_set_to_die_with_its_instance():
-    """``delete_on_termination`` is the backstop for the controller dying between
-    deleting a server and deleting its volume -- a window that exists on every
-    restart and deploy. Nova does NOT default it on: the C0.2 probe reported
-    ``Delete On Termination: False``."""
+def test_the_volume_rides_along_in_the_build(tmp_path):
+    """Attached by block device mapping, never by a later call.
+
+    Nova refuses ``attach_volume`` while the instance is in ``vm_state building``, and
+    ``create_server`` returns while it still is -- so a post-create attach fails 100 %
+    of the time. Observed on the mirror 2026-08-21, 17 ms after the create, and missed
+    by these tests until the fake started rejecting it the way Nova does.
+
+    ``boot_index: -1`` means attach-but-do-not-boot; the root disk still comes from the
+    image. And ``delete_on_termination`` lives here, which is also where it stops being
+    Nova's default of False -- the C0.2 probe reported it as False on a plain attach.
+    """
     cloud = _Cloud()
+    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
 
-    fleet.attach_volume(cloud, "server-1", "vol-1")
+    ctl.step()
 
-    server, volume_id, kwargs = cloud.attachments_made[0]
-    assert (server, volume_id) == ("server-1", "vol-1")
-    assert kwargs["delete_on_termination"] is True
+    bdm = cloud.created_servers[0]["block_device_mapping"]
+    assert len(bdm) == 1
+    assert bdm[0]["uuid"] == cloud.volumes_[0].id
+    assert bdm[0]["source_type"] == "volume"
+    assert bdm[0]["destination_type"] == "volume"
+    assert bdm[0]["delete_on_termination"] is True
+    assert bdm[0]["boot_index"] == -1, "must not displace the image as the boot disk"
+    assert cloud.attachments_made == [], "no separate attach call: Nova would 409"
+
+
+def test_no_block_device_mapping_when_volumes_are_off(tmp_path):
+    """A create with no volume must be byte-for-byte the pre-C2 call -- an empty BDM
+    list is not the same thing to Nova as an absent key."""
+    cloud = _Cloud()
+    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=False), _cfg(tmp_path))
+
+    ctl.step()
+
+    assert "block_device_mapping" not in cloud.created_servers[0]
 
 
 # --- the create path, and its rollbacks -----------------------------------
@@ -292,7 +331,7 @@ def test_a_worker_gets_a_volume_when_armed(tmp_path):
     assert cloud.volumes_[0].id in fleet.gzip.decompress(
         fleet.base64.b64decode(user_data)
     ).decode()
-    assert cloud.attachments_made
+    assert cloud.attachments_made == [], "attached via the build, not a second call"
     assert not cloud.deleted_volumes
 
 
@@ -339,19 +378,6 @@ def test_a_volume_is_reclaimed_when_the_instance_cannot_be_created(tmp_path):
     assert cloud.volumes_ == []
 
 
-def test_both_halves_go_back_when_the_attach_fails(tmp_path):
-    """A worker holding an unattached volume is the worst outcome available: it has
-    spent one of eight volumes AND will run on the root disk this plan exists to
-    escape. The boot block would refuse to start anyway rather than guess a device."""
-    cloud = _Cloud(attach_error=RuntimeError("cinder said no"))
-    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
-
-    ctl.step()
-
-    assert cloud.deleted_volumes
-    assert cloud.deleted_servers, "a worker with no scratch disk must not be left running"
-
-
 def test_a_full_cinder_quota_is_backpressure_not_a_breaker_trip(tmp_path):
     """The breaker exists to catch a broken image. Letting a full storage allocation
     feed it would stop the whole fleet precisely when it is busiest -- the S6 mistake
@@ -380,7 +406,11 @@ def test_attachments_are_read_before_the_server_is_deleted(tmp_path):
     assert volumes == ("vol-9",)
 
     fleet.delete_volume(cloud, "vol-9", instance_id="server-1")
-    assert cloud.detached == [("vol-9", "server-1")]
+    # (server, volume): the order openstacksdk actually takes. Reversed, it raises
+    # `got multiple values for argument 'server'` -- which happened on the mirror and
+    # was masked by delete_volume's own except, so the volume was still reclaimed and
+    # only the logged traceback showed the detach had never run.
+    assert cloud.detached == [("server-1", "vol-9")]
     assert cloud.deleted_volumes == ["vol-9"]
 
 

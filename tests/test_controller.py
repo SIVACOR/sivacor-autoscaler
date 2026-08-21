@@ -155,7 +155,9 @@ def _armed(monkeypatch, ctl, conn):
     """Point the controller's create path at `conn`, bypassing OpenStack entirely."""
     monkeypatch.setattr(controller_mod.fleet, "build_user_data", lambda *a, **k: "#!/bin/bash\n")
 
-    def create_instance(_conn, _cfg, _user_data, flavor=None, size=None):
+    def create_instance(
+        _conn, _cfg, _user_data, flavor=None, size=None, volume_id=None
+    ):
         conn.creates += 1
         if conn.fail:
             raise RuntimeError("user_data is 65600 bytes encoded, over Nova's 65535")
