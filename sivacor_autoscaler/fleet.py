@@ -438,9 +438,12 @@ def create_instance(
 
     name = f"sivacor-worker-{uuid.uuid4().hex[:8]}"
     want_flavor = flavor or cfg.flavor
+    # Resolved once: it goes into `image_id` and, when a volume is attached, into the
+    # boot entry of the block device mapping as well.
+    image_id = _require(conn.compute.find_image, cfg.image, "image")
     kwargs = {
         "name": name,
-        "image_id": _require(conn.compute.find_image, cfg.image, "image"),
+        "image_id": image_id,
         "flavor_id": _require(conn.compute.find_flavor, want_flavor, "flavor"),
         "networks": [{"uuid": _require(conn.network.find_network, cfg.network, "net")}],
         # Base64 because compute.create_server passes user_data through verbatim --
@@ -479,14 +482,33 @@ def create_instance(
         # from `image_id` above. delete_on_termination lives here rather than on a
         # separate attachment call, which is also how it stops being Nova's default of
         # False -- see the C0.2 probe.
+        # **The boot entry is mandatory once a BDM is present at all**, and its absence
+        # is not a subtle failure: Nova rejects the whole create with `400 Block Device
+        # Mapping is Invalid: Boot sequence for the instance and image/block device
+        # mapping combination is not valid`. Observed on the mirror 2026-08-21 with a
+        # BDM carrying only the volume.
+        #
+        # `image_id` above does NOT satisfy that check. Both are sent, which is exactly
+        # what `openstack server create --image X --block-device-mapping ...` does:
+        # python-openstackclient builds this same pair and refuses outright to send a
+        # BDM with no `boot_index: 0` entry (`compute/v2/server.py`, "An image ... or
+        # bootable volume ... is required"). Copied from the path that demonstrably
+        # works on JS2 rather than derived from the API reference.
         kwargs["block_device_mapping"] = [
             {
+                "uuid": image_id,
+                "boot_index": 0,
+                "source_type": "image",
+                "destination_type": "local",
+                "delete_on_termination": True,
+            },
+            {
                 "uuid": volume_id,
+                "boot_index": -1,
                 "source_type": "volume",
                 "destination_type": "volume",
                 "delete_on_termination": True,
-                "boot_index": -1,
-            }
+            },
         ]
     if cfg.key_name:
         kwargs["key_name"] = cfg.key_name

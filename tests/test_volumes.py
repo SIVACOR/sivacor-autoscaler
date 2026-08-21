@@ -292,13 +292,43 @@ def test_the_volume_rides_along_in_the_build(tmp_path):
     ctl.step()
 
     bdm = cloud.created_servers[0]["block_device_mapping"]
-    assert len(bdm) == 1
-    assert bdm[0]["uuid"] == cloud.volumes_[0].id
-    assert bdm[0]["source_type"] == "volume"
-    assert bdm[0]["destination_type"] == "volume"
-    assert bdm[0]["delete_on_termination"] is True
-    assert bdm[0]["boot_index"] == -1, "must not displace the image as the boot disk"
+    # TWO entries. The boot entry is mandatory once a BDM is present at all: without it
+    # Nova rejects the whole create with `400 Block Device Mapping is Invalid: Boot
+    # sequence ... is not valid`, which is how the second mirror run failed. image_id
+    # alone does not satisfy that check, and both are sent -- the same pair
+    # python-openstackclient builds.
+    assert len(bdm) == 2
+    boot, scratch = bdm
+    assert boot["boot_index"] == 0
+    assert boot["source_type"] == "image"
+    assert boot["destination_type"] == "local"
+    assert boot["uuid"] == "image-id"
+    assert cloud.created_servers[0]["image_id"] == "image-id", (
+        "image_id is still sent alongside the BDM boot entry"
+    )
+    assert scratch["uuid"] == cloud.volumes_[0].id
+    assert scratch["source_type"] == "volume"
+    assert scratch["destination_type"] == "volume"
+    assert scratch["delete_on_termination"] is True
+    assert scratch["boot_index"] == -1, "must not displace the image as the boot disk"
     assert cloud.attachments_made == [], "no separate attach call: Nova would 409"
+
+
+def test_a_block_device_mapping_always_carries_a_boot_entry(tmp_path):
+    """The invariant, asserted on its own because violating it fails the *create*.
+
+    python-openstackclient refuses to send a BDM with no ``boot_index: 0`` entry at
+    all, and Nova agrees: a mapping listing only the scratch volume is rejected
+    outright, so the failure is a submission that never boots rather than a worker
+    with no disk.
+    """
+    cloud = _Cloud()
+    ctl = Controller(cloud, _Redis(), _Girder(volumes_enabled=True), _cfg(tmp_path))
+
+    ctl.step()
+
+    bdm = cloud.created_servers[0]["block_device_mapping"]
+    assert sum(1 for e in bdm if e.get("boot_index") == 0) == 1
 
 
 def test_no_block_device_mapping_when_volumes_are_off(tmp_path):
