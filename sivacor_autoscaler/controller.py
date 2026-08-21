@@ -52,6 +52,18 @@ class Config:
     #: How long the breaker stays open before ONE creation attempt is allowed again.
     #: Non-negotiable that this exists at all: see Controller._expire_breaker.
     breaker_cooldown: float = 900.0
+    #: GB of scratch volume to attach to each worker, or ``None`` for no volume.
+    #:
+    #: **One fixed size for every instance while this is set, not the size a
+    #: submission asked for.** C2 of cinder_volumes_plan.md is the machinery only: the
+    #: per-submission figure is recorded by C1 and read by C3. Keeping them apart is
+    #: the same discipline as P2 shipping targeted assignment against a one-rung
+    #: catalogue -- when a submission stalls there is one candidate cause, not two.
+    #:
+    #: ``None`` is the default and means every code path here is the pre-C2 one, with
+    #: no Cinder call in it at all. The *arming* decision is the Girder setting
+    #: ``sivacor.volumes_enabled``, checked per tick; this is only how big.
+    volume_size_gb: int | None = None
     limits: Limits = field(default_factory=Limits)
 
 
@@ -265,6 +277,9 @@ class Controller:
             logger.warning("%s", alert)
 
         by_id = {i.id: i for i in state.instances}
+        # Read once per tick, like the arm flag: two creates in one round must not
+        # disagree about whether this deployment attaches volumes.
+        volumes_on = bool(self.cfg.volume_size_gb) and signals.volumes_enabled(self.db)
 
         # Deletes first: they free slots the creates may want, and they must happen
         # even when the breaker has blocked creation.
@@ -279,10 +294,32 @@ class Controller:
                     why=decision.reap_reasons.get(instance_id, "unrecorded"),
                     job=state.running_jobs.get(instance_id),
                 )
+            # Strictly before the delete, like the capture above: an attachment is a
+            # property of the server, so deleting it first destroys the only cheap way
+            # to find what to reclaim. Empty unless this deployment attaches volumes,
+            # in which case this is one extra call per reap.
+            # Gated on the *configured size*, deliberately NOT on this tick's
+            # `volumes_on`. An instance booted while armed still has a volume after
+            # someone disarms the flag, and gating the reclaim on the live flag would
+            # leak every one of those. A deployment that never configured a size cannot
+            # have volumes, so it still pays no call. (Unsetting the size entirely while
+            # instances hold volumes does leak here -- which is what
+            # delete_on_termination is the backstop for.)
+            volumes = (
+                fleet.volumes_attached_to(self.conn, instance_id)
+                if self.cfg.volume_size_gb
+                else ()
+            )
             try:
                 fleet.delete_instance(self.conn, instance_id)
             except Exception:
                 logger.warning("could not delete %s", instance_id, exc_info=True)
+            # After the server, and best effort. `delete_on_termination` means Nova has
+            # probably already removed these, so `ignore_missing` is doing real work
+            # here rather than papering over a bug -- this is the belt to that braces,
+            # and the path that logs a sentence naming the volume.
+            for volume_id in volumes:
+                fleet.delete_volume(self.conn, volume_id, instance_id=instance_id)
 
         # Assignments before creates: placing work on an instance that already exists is
         # the cheap half, and a create that fails must not stop it. Each binding is
@@ -310,6 +347,17 @@ class Controller:
                 # so only reachable while targeted assignment is off. Those get
                 # `SIVACOR_OS_FLAVOR`, which is the pre-P3 behaviour for the pre-P3 path.
                 want_flavor = catalogue.flavor_for(self.rungs, rung, self.cfg.flavor)
+                # The volume BEFORE the user-data, because the boot block builds its
+                # device path from the volume id and user_data is fixed at create time
+                # -- an instance cannot be told anything discovered after it exists.
+                # That is also V4's ordering, and it fails toward the recoverable side:
+                # a volume with no instance is reclaimable, a worker with no volume
+                # runs the submission on the root disk this plan exists to escape.
+                volume_id = (
+                    fleet.create_volume(self.conn, self.cfg, self.cfg.volume_size_gb)
+                    if volumes_on
+                    else None
+                )
                 user_data = fleet.build_user_data(
                     self.cfg.template,
                     master_key_hex=self.cfg.master_key_hex,
@@ -319,10 +367,20 @@ class Controller:
                     worker_image=self.cfg.worker_image,
                     worker_queues=self.cfg.worker_queues,
                     worker_size=rung,
+                    volume_id=volume_id,
                 )
-                fleet.create_instance(
-                    self.conn, self.cfg, user_data, flavor=want_flavor, size=rung
-                )
+                try:
+                    instance_id = fleet.create_instance(
+                        self.conn, self.cfg, user_data, flavor=want_flavor, size=rung
+                    )
+                except Exception:
+                    # Reclaim before re-raising, or the volume becomes an orphan only
+                    # the C5 sweep could find -- and C5 does not exist yet.
+                    if volume_id:
+                        fleet.delete_volume(self.conn, volume_id)
+                    raise
+                if volume_id:
+                    self._attach_or_discard(instance_id, volume_id)
                 # A create that works is the only positive evidence that whatever
                 # tripped the breaker is over. Nothing else cleared this counter
                 # before 2026-08-12.
@@ -343,6 +401,38 @@ class Controller:
                     exc_info=True,
                 )
                 break
+
+    def _attach_or_discard(self, instance_id: str, volume_id: str) -> None:
+        """Attach the volume, or throw away both halves.
+
+        **Discarding the instance is the point of this method.** A worker holding an
+        unattached volume boots without it, runs its submission on the plain 60 GB root
+        disk, and fails exactly the way this plan exists to prevent -- while having
+        consumed a volume from a quota of eight. Since C0 that failure is at least
+        *attributable* (it records ``out_of_disk`` rather than ``image_pull_failed``),
+        but attributable is not acceptable: the submission still dies after waiting for
+        a boot, and the boot block would have refused to start anyway, because it exits
+        non-zero rather than guessing a device.
+
+        So both go back and the submission stays queued for the next tick. One wasted
+        boot against a silent breach of what the fleet promised.
+
+        Order matters: the **volume first**. Once the instance is gone
+        ``volumes_attached_to`` can no longer find the volume, and only a sweep would.
+        """
+        try:
+            fleet.attach_volume(self.conn, instance_id, volume_id)
+        except Exception:
+            logger.warning(
+                "could not attach volume %s to %s; discarding both and leaving the "
+                "submission queued",
+                volume_id,
+                instance_id,
+                exc_info=True,
+            )
+            fleet.delete_volume(self.conn, volume_id, instance_id=instance_id)
+            fleet.delete_instance(self.conn, instance_id)
+            raise
 
     def run(self) -> None:
         logger.info(

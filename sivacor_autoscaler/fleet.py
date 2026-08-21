@@ -76,6 +76,177 @@ def size_tag(memory_gb: int) -> str:
     return f"{SIZE_TAG_PREFIX}{memory_gb}"
 
 
+#: Marks a Cinder volume as this fleet's: ``sivacor-worker-volume:<deployment>:<hex>``.
+#:
+#: **A volume outside this naming is invisible to its own controller** -- never
+#: counted, never reaped, holding a slot until a human notices. That is the failure
+#: ``create_instance``'s "both tags, always" comment exists to prevent, and it is
+#: worse here: the project has 10 volumes total, two of them permanently the two
+#: deployments' data volumes, so eight leaks exhaust the count quota and the next thing
+#: refused a volume is the *manager* whose 800 GB volume holds the assetstore.
+#:
+#: The deployment is in the name, so the mirror and production never reap each other's
+#: -- the same scoping instances get from :func:`deployment_tag`, by the only channel a
+#: Cinder listing carries without a second round trip.
+#:
+#: **Deliberately NOT the instance id**, which the first draft of this used.
+#: ``user_data`` is built before the instance exists, so an instance cannot be told an
+#: id derived from itself -- see :func:`create_volume`. Correlation runs the other way
+#: instead: a volume knows what it is attached to, so the reap path reads the server's
+#: attachments and the C5 sweep looks for *unattached* volumes of ours.
+VOLUME_NAME_PREFIX = "sivacor-worker-volume:"
+
+
+def volume_name(deployment: str) -> str:
+    """A fresh, unique, deployment-scoped name for one scratch volume."""
+    return f"{VOLUME_NAME_PREFIX}{deployment}:{uuid.uuid4().hex[:8]}"
+
+
+def is_worker_volume(name: str | None, deployment: str) -> bool:
+    """Whether ``name`` is a scratch volume belonging to ``deployment``."""
+    if not name or not name.startswith(VOLUME_NAME_PREFIX):
+        return False
+    rest = name[len(VOLUME_NAME_PREFIX) :]
+    return rest.startswith(f"{deployment}:")
+
+
+def create_volume(conn, cfg, size_gb: int) -> str:
+    """Create one scratch volume for this fleet. Returns its id.
+
+    Raises :class:`QuotaExceeded` when the Cinder allocation is full, so the caller
+    treats it as backpressure and leaves the submission queued -- the same contract
+    :func:`create_instance` has, and for the same reason: a full quota must not feed
+    the circuit breaker, whose job is to catch a broken image rather than a busy
+    allocation.
+
+    ``__DEFAULT__`` volume type, decided 2026-08-21 (open item 4 of
+    cinder_volumes_plan.md): ``replicated_hdd`` buys durability that is worthless for
+    a volume destroyed at reap, and pays for it in speed on a workload -- extraction,
+    zipping -- that is IO-bound and already racing ``sivacor.max_runtime``.
+
+    **Called BEFORE the instance, which V4 said and which the implementation then
+    tried to reverse.** The first draft created the instance first so the volume could
+    be named after it; that cannot work, because ``build_user_data`` runs before
+    ``create_server`` and the boot block needs the volume id to construct its device
+    path (V5). The volume therefore comes first and carries a random name, and V4's
+    ordering turns out to be forced rather than merely preferable -- it also happens to
+    be the ordering that fails toward the recoverable side, which was V4's own
+    argument for it.
+    """
+    name = volume_name(cfg.deployment)
+    try:
+        volume = conn.block_storage.create_volume(
+            name=name,
+            size=size_gb,
+            description=(
+                f"SIVACOR scratch disk for a {cfg.deployment} worker. "
+                "Deleted when its worker is reaped."
+            ),
+        )
+    except Exception as exc:
+        if _is_quota_error(exc):
+            raise QuotaExceeded(str(exc)) from exc
+        raise
+    logger.info("created volume %s (%s) of %d GB", name, volume.id, size_gb)
+    return volume.id
+
+
+def attach_volume(conn, instance_id: str, volume_id: str) -> None:
+    """Attach ``volume_id`` to ``instance_id``, set to die with it.
+
+    ``delete_on_termination`` is belt and braces over the explicit detach-and-delete in
+    the reap path, and it is not optional. The controller can die between deleting a
+    server and deleting its volume -- a crash, a restart, a ``docker service update``
+    -- and that window exists on every deploy. Nova then reclaims the volume without
+    anyone noticing, which is the difference between a leak and no leak on an unclean
+    restart. **It is not the default**: the C0.2 probe attached a volume and Nova
+    reported ``Delete On Termination: False``.
+    """
+    conn.compute.create_volume_attachment(
+        server=instance_id,
+        volumeId=volume_id,
+        delete_on_termination=True,
+    )
+    logger.info(
+        "attached volume %s to %s (delete_on_termination)", volume_id, instance_id
+    )
+
+
+def delete_volume(conn, volume_id: str, instance_id: str | None = None) -> None:
+    """Detach if attached, then delete. Best effort, and says so when it fails.
+
+    Ordered detach-then-delete rather than relying on ``delete_on_termination`` alone,
+    because this is the path that logs a sentence an operator can read -- and because
+    it also covers the volume whose *instance* creation failed after the volume
+    existed, which no termination hook can reach.
+    """
+    if instance_id:
+        try:
+            conn.compute.delete_volume_attachment(
+                volume_id, server=instance_id, ignore_missing=True
+            )
+        except Exception:
+            # An already-detached volume, or a server Nova has forgotten. Either way
+            # the delete below is what matters; failing here would strand it. Logged
+            # with the traceback rather than swallowed, because "detach did nothing"
+            # and "detach broke" look identical from the next line onwards.
+            logger.info(
+                "no attachment to remove for volume %s on %s",
+                volume_id,
+                instance_id,
+                exc_info=True,
+            )
+    try:
+        conn.block_storage.delete_volume(volume_id, ignore_missing=True)
+    except Exception:
+        # Deliberately loud: the count quota is 8 and this is how it leaks.
+        logger.warning(
+            "could not delete volume %s -- it now holds quota until reclaimed by hand",
+            volume_id,
+            exc_info=True,
+        )
+        return
+    logger.info("deleted volume %s", volume_id)
+
+
+def list_worker_volumes(conn, deployment: str) -> tuple[tuple[str, bool], ...]:
+    """Our scratch volumes as ``((volume_id, is_attached), ...)``.
+
+    The attachment flag is what the C5 sweep needs: an unattached volume of ours has no
+    worker behind it, whether because the instance is gone or because it never
+    existed. Left unused by C2 -- the reap path correlates through the *server*, which
+    is cheaper and exact -- and here so the sweep has something to build on.
+    """
+    out = []
+    for volume in conn.block_storage.volumes():
+        if not is_worker_volume(getattr(volume, "name", None), deployment):
+            continue
+        out.append((volume.id, bool(getattr(volume, "attachments", None))))
+    return tuple(out)
+
+
+def volumes_attached_to(conn, instance_id: str) -> tuple[str, ...]:
+    """Volume ids Nova reports attached to ``instance_id``.
+
+    **Read this before deleting the server, not after**: the attachment is a property
+    of the server, so deleting it first destroys the only cheap way to find what to
+    reclaim. Same ordering constraint, for the same reason, as the pre-delete
+    diagnostics capture.
+
+    Best effort. A listing that raises must not stop a reap -- an instance left alive
+    because we could not enumerate its disks is worse than a volume left behind, which
+    the C5 sweep is there to catch.
+    """
+    try:
+        attachments = conn.compute.volume_attachments(instance_id)
+        return tuple(a.volume_id for a in attachments if getattr(a, "volume_id", None))
+    except Exception:
+        logger.warning(
+            "could not list volume attachments for %s", instance_id, exc_info=True
+        )
+        return ()
+
+
 def _flavor_name(server) -> str | None:
     """The flavour's name from a detailed server listing, or ``None``.
 
@@ -132,6 +303,7 @@ def build_user_data(
     worker_image: str | None = None,
     worker_queues: str | None = None,
     worker_size: int | None = None,
+    volume_id: str | None = None,
 ) -> str:
     """Inject configuration into the cloud-init template.
 
@@ -177,6 +349,14 @@ def build_user_data(
         # worker's own journal say which rung the controller believed it was booting --
         # the one place that belief and the hardware could silently disagree.
         lines.append(f"SIVACOR_WORKER_SIZE={shlex.quote(str(worker_size))}")
+    if volume_id:
+        # Load-bearing on the box, unlike SIVACOR_WORKER_SIZE above: the boot block
+        # constructs its device path from this id, and an empty value means "no
+        # volume" and skips the block entirely. Passed as the id rather than as a
+        # device path because the path is a property of the guest's udev rules, not of
+        # anything this process knows -- see the C0.2 measurement in
+        # cinder_volumes_plan.md V5.
+        lines.append(f"SIVACOR_VOLUME_ID={shlex.quote(volume_id)}")
     return text.replace(INJECT_MARKER, "\n".join(lines))
 
 

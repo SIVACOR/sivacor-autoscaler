@@ -90,6 +90,34 @@ def targeted_assignment(db) -> bool:
     return bool(doc and doc.get("value"))
 
 
+#: Girder setting gating scratch volumes, from cinder_volumes_plan.md C1/C2.
+VOLUMES_ENABLED_KEY = "sivacor.volumes_enabled"
+
+
+def volumes_enabled(db) -> bool:
+    """Whether this controller should attach a scratch volume to each worker.
+
+    **The same setting ``submit_job`` gates on, read the same way, for the same
+    reason** as :func:`targeted_assignment`: two processes have to agree. Girder
+    decides whether to *accept* a request for extra disk; this decides whether to
+    *create* one. A state where Girder accepts and the controller does not create is a
+    promise silently broken -- the submission runs on the plain root disk and fails the
+    way it did before any of this existed. One document cannot be in that state.
+
+    Per-tick, so arming and disarming land within one interval with no restart to
+    forget. Contrast the worker-size catalogue, which is read once at startup because
+    the check standing between a flavour typo and a tripped breaker cannot be run every
+    30 s -- there is no equivalent check here, so there is no reason not to be live.
+
+    **Off on an absent document**, matching ``settings.py``'s seeded default. Unlike
+    the arm flag this may default rather than raise: guessing off means no volume is
+    created, which is exactly the pre-C2 behaviour and safe in every deployment. The
+    arm flag has no such safe guess, which is why it raises.
+    """
+    doc = db[SETTING_COLLECTION].find_one({"key": VOLUMES_ENABLED_KEY})
+    return bool(doc and doc.get("value"))
+
+
 def queue_depth(redis_client, queue: str) -> int:
     """Submissions published to ``queue`` that no worker has taken yet.
 

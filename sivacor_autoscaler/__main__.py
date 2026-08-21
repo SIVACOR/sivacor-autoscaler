@@ -71,6 +71,18 @@ def build_config() -> Config:
         diagnostics_dir=(
             Path(d) if (d := _env("SIVACOR_DIAGNOSTICS_DIR")) else None
         ),
+        # Unset = no scratch volume, and every Cinder code path stays unreached.
+        # C2 of cinder_volumes_plan.md: ONE fixed size for every worker, not the size
+        # a submission asked for -- that is C3. The *arming* decision is the Girder
+        # setting `sivacor.volumes_enabled`, read per tick, because Girder and this
+        # process both have to agree about it; this variable only says how big.
+        #
+        # Set it far below the Cinder quota. Live 2026-08-21: 10 volumes / 2000 GB for
+        # the project, of which two volumes and 1000 GB are the two deployments' own
+        # data volumes -- production's 800 GB one holds the assetstore. So the fleet
+        # has 8 volumes and 1000 GB, and with max_instances=5 the *count* is the
+        # tighter limit, leaving three spare as the entire margin for a leak.
+        volume_size_gb=(int(v) if (v := _env("SIVACOR_VOLUME_SIZE_GB")) else None),
         limits=Limits(
             max_instances=int(_env("SIVACOR_MAX_INSTANCES", "5")),
             max_lifetime=timedelta(hours=float(_env("SIVACOR_MAX_LIFETIME_HOURS", "30"))),
@@ -224,6 +236,21 @@ def main() -> int:
             "at the 30 GiB rung but only ~9 at 125 GiB. Set both once the catalogue "
             "offers a rung where that arithmetic turns over (S6, superseding D3)",
             cfg.limits.max_instances,
+        )
+
+    # Same family as the quota-headroom line below: `SIVACOR_MAX_VCPUS=8` reached the
+    # container on 2026-08-20 and nothing in the log said so, which is provable only
+    # with `docker exec ... env`. Say what this process believes about volumes.
+    if cfg.volume_size_gb:
+        logging.getLogger(__name__).info(
+            "scratch volumes: %d GB per worker, __DEFAULT__ type, armed by the Girder "
+            "setting sivacor.volumes_enabled (C2). Cinder quota is 10 volumes / "
+            "2000 GB for the project, two volumes and 1000 GB of it permanent",
+            cfg.volume_size_gb,
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "scratch volumes: off (SIVACOR_VOLUME_SIZE_GB unset)"
         )
 
     # Sixth of the same family, and the one that fails latest if left unsaid. Once
