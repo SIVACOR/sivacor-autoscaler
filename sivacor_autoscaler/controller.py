@@ -55,7 +55,7 @@ class Config:
     #: GB of scratch volume to attach to each worker, or ``None`` for no volume.
     #:
     #: **One fixed size for every instance while this is set, not the size a
-    #: submission asked for.** C2 of cinder_volumes_plan.md is the machinery only: the
+    #: submission asked for.** C2 of 05_cinder_volumes_plan.md is the machinery only: the
     #: per-submission figure is recorded by C1 and read by C3. Keeping them apart is
     #: the same discipline as P2 shipping targeted assignment against a one-rung
     #: catalogue -- when a submission stalls there is one candidate cause, not two.

@@ -100,7 +100,7 @@ class WaitingSubmission:
     """A RUNNING submission that has not been given a worker yet.
 
     Absence of ``meta.worker_queue`` is the marker. Under targeted assignment (S2 of
-    ``worker_sizing_plan.md``) the *controller* writes that field, so this set is both
+    ``03_worker_sizing_plan.md``) the *controller* writes that field, so this set is both
     the assigner's input and, unchanged, the demand signal that already scales the
     fleet -- one query, one representation. See :attr:`FleetState.waiting`.
 
@@ -207,7 +207,7 @@ class Limits:
     unclaimed_grace: timedelta = timedelta(minutes=2)
 
     #: Arm targeted assignment: choose an instance per submission and publish the
-    #: chain to that instance's private queue (S2/S3 of ``worker_sizing_plan.md``).
+    #: chain to that instance's private queue (S2/S3 of ``03_worker_sizing_plan.md``).
     #:
     #: **Off by default, and it must be flipped together with Girder's own flag, never
     #: alone.** With this on while ``submit_job`` still publishes to the shared queue,
@@ -466,7 +466,7 @@ def decide(state: FleetState, limits: Limits) -> Decision:
     instances that tripped it.
 
     **Assignment is the same decision as capacity, which is why it lives here**
-    (S3 of ``worker_sizing_plan.md``). Under :attr:`Limits.assign` the function also
+    (S3 of ``03_worker_sizing_plan.md``). Under :attr:`Limits.assign` the function also
     returns which waiting submission goes on which instance, oldest submission first
     (S7). Putting it anywhere else would mean implementing that ordering twice, from two
     snapshots taken at two different times, and the failure of the two disagreeing is

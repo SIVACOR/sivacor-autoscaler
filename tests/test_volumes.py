@@ -1,6 +1,6 @@
 """Scratch volumes: create, attach, reclaim, and never leak one.
 
-C2 of ``development_notes/cinder_volumes_plan.md``. What is under test is almost
+C2 of ``development_notes/05_cinder_volumes_plan.md``. What is under test is almost
 entirely the *failure* paths, because the happy path is three API calls and the
 interesting question is what happens when one of them does not answer.
 

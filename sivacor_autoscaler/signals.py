@@ -33,7 +33,7 @@ JOB_RUNNING = 2
 #:    about staying on HTTP applies to *writes*: failing a submission has to fire
 #:    ``jobs.job.update.after``, which is bound only in the Girder server process.
 #:    Nothing here writes, so that constraint does not bind -- but S2/S3 of
-#:    ``worker_sizing_plan.md`` make this process the *assigner*, and its first
+#:    ``03_worker_sizing_plan.md`` make this process the *assigner*, and its first
 #:    ``meta.worker_queue`` write ends that. The replacement rule is already known
 #:    rather than guessed: it was measured in the deployed controller container on
 #:    2026-08-19 (that plan's open item 6).
@@ -90,7 +90,7 @@ def targeted_assignment(db) -> bool:
     return bool(doc and doc.get("value"))
 
 
-#: Girder setting gating scratch volumes, from cinder_volumes_plan.md C1/C2.
+#: Girder setting gating scratch volumes, from 05_cinder_volumes_plan.md C1/C2.
 VOLUMES_ENABLED_KEY = "sivacor.volumes_enabled"
 
 

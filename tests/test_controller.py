@@ -323,7 +323,7 @@ def test_an_assignment_is_executed_against_the_instances_private_queue(monkeypat
     """The one line that is the feature, reached from a decision.
 
     Before this the executor did not exist and step() logged an ERROR instead -- a
-    decision nothing acts on, which is how two changes in autoscaling_plan.md shipped
+    decision nothing acts on, which is how two changes in 01_autoscaling_plan.md shipped
     inert for two loop tests.
     """
     ctl, calls = controller([]), []

@@ -1,7 +1,7 @@
 """The worker-size catalogue: read it from Girder, check it against Nova.
 
 One rung per shape a submission may ask for. The catalogue lives in Girder as
-``sivacor.worker_sizes`` (P0.3 of ``worker_sizing_plan.md``) because it has to be
+``sivacor.worker_sizes`` (P0.3 of ``03_worker_sizing_plan.md``) because it has to be
 readable by two processes that share no other config channel: ``girder-sivacor``
 validates a submission against it and renders the picker from it, and this controller
 boots the flavour it names.

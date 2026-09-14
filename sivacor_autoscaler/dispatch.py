@@ -1,6 +1,6 @@
 """Executing an assignment: claim the submission, then publish its chain.
 
-This is the write half of S3 in ``worker_sizing_plan.md``, and the only place this
+This is the write half of S3 in ``03_worker_sizing_plan.md``, and the only place this
 process writes to Girder at all. Everything it does is deliberately small:
 
 1. one atomic ``find_one_and_update`` on ``meta.*`` -- byte for byte what
@@ -130,7 +130,7 @@ def publish(job, queue: str) -> None:
 def _record_head_job(chain, submission) -> None:
     """Create the child job for the chain's first step, which nothing else will.
 
-    **Measured, not assumed, on 2026-08-19** -- this is ``worker_sizing_plan.md``'s
+    **Measured, not assumed, on 2026-08-19** -- this is ``03_worker_sizing_plan.md``'s
     open item 7, and the answer is that ``girder_before_task_publish`` does *not*
     behave the same when the publisher is not the Girder server:
 

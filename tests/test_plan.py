@@ -408,13 +408,13 @@ def test_unclaimed_absent_keeps_old_behaviour():
     assert not d.alerts
 
 
-# --- targeted assignment (S2/S7 of worker_sizing_plan.md) ------------------
+# --- targeted assignment (S2/S7 of 03_worker_sizing_plan.md) ------------------
 #
 # The controller stops letting a shared queue decide which worker takes which
 # submission and binds them itself, one instance per submission. The arithmetic is
 # driven here, in full, before any of it touches Mongo -- because the failure mode of
 # getting it wrong is a submission that waits forever while the fleet reports itself
-# healthy and idle, which is the same shape as every stall in autoscaling_plan.md.
+# healthy and idle, which is the same shape as every stall in 01_autoscaling_plan.md.
 
 #: Assignment armed. Everything else default, so these cases exercise the flag alone.
 ASSIGN = Limits(max_instances=5, assign=True)

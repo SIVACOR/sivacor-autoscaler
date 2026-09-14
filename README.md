@@ -5,7 +5,7 @@ the work is done, so the allocation is only charged for instances that are actua
 verifying something.
 
 Runs on the manager, where the broker, Girder and the OpenStack credentials are.
-Design rationale lives in `autoscaling_plan.md` (P3) in the workspace root; this README
+Design rationale lives in `01_autoscaling_plan.md` (P3) in the workspace root; this README
 covers only what is needed to run it.
 
 ## Shape

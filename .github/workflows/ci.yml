@@ -29,7 +29,7 @@ jobs:
       - name: Test
         run: pytest -q
 
-  # DEPRECATED as of 2026-08-13 (worker_sizing_plan.md P0.5). Nothing deploys this
+  # DEPRECATED as of 2026-08-13 (03_worker_sizing_plan.md P0.5). Nothing deploys this
   # image any more: the controller now runs from the girder-sivacor image, which
   # pip-installs this package at a pinned sha, because assignment needs Girder's
   # model layer in-process (S3). `deploy-sivacor` no longer references
