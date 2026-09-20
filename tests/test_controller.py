@@ -475,3 +475,116 @@ def test_the_flavour_map_lets_an_untagged_instance_be_placed():
     ctl.rungs = (catalogue.Rung(30, "m3.medium", 8), catalogue.Rung(60, "m3.large", 16))
 
     assert ctl._flavor_sizes() == {"m3.medium": 30, "m3.large": 60}
+
+
+# --- per-user accounting: the one thing this repo contributes (09-A3) -------
+
+
+def reaping_controller(monkeypatch, instances, deleted, recorded):
+    """A controller whose only live step is the reap loop."""
+    ctl = controller([])
+    monkeypatch.setattr(
+        controller_mod.signals, "volumes_enabled", lambda db: False
+    )
+    monkeypatch.setattr(
+        controller_mod.fleet, "delete_instance",
+        lambda conn, instance_id: deleted.append(instance_id),
+    )
+    monkeypatch.setattr(
+        controller_mod, "_record_lifetime",
+        lambda instance: recorded.append(instance.id if instance else None),
+    )
+    monkeypatch.setattr(ctl, "limits", lambda: Limits())
+    monkeypatch.setattr(
+        ctl,
+        "gather",
+        lambda limits=None: FleetState(
+            instances=instances, queue_depth=0, serving=0
+        ),
+    )
+    monkeypatch.setattr(
+        controller_mod, "decide",
+        lambda state, limits: Decision(delete=[i.id for i in instances]),
+    )
+    return ctl
+
+
+def test_a_lifetime_is_recorded_before_the_instance_is_deleted(monkeypatch):
+    """The ordering is the entire value of the call.
+
+    ``created_at`` lives on the server. Once Nova has deleted it there is no
+    measuring how long the instance existed, and the run's SU belong to nobody.
+    Same constraint as the diagnostics capture and the volume read beside it.
+    """
+    order = []
+    ctl = reaping_controller(
+        monkeypatch,
+        [live("uuid-a")],
+        deleted=_Appender(order, "deleted"),
+        recorded=_Appender(order, "recorded"),
+    )
+    ctl.step()
+    assert order == [("recorded", "uuid-a"), ("deleted", "uuid-a")]
+
+
+def test_a_reap_survives_an_accounting_failure(monkeypatch):
+    """Constraint 1, as an assertion, against the *real* helper.
+
+    ``girder_sivacor`` is genuinely not installed in this venv, so the import
+    inside ``_record_lifetime`` really does fail here -- which makes this the
+    honest version of "a deployment whose image somehow lacks the plugin". A
+    counter must never cost the fleet a reap: an unreaped instance holds a quota
+    slot and stalls submissions, which is far worse than an under-count (09-U9).
+    """
+    deleted = []
+    ctl = reaping_controller(monkeypatch, [live("uuid-a")], deleted, [])
+    monkeypatch.undo()  # put the real _record_lifetime back
+    monkeypatch.setattr(
+        controller_mod.signals, "volumes_enabled", lambda db: False
+    )
+    monkeypatch.setattr(
+        controller_mod.fleet,
+        "delete_instance",
+        lambda conn, instance_id: deleted.append(instance_id),
+    )
+    monkeypatch.setattr(ctl, "limits", lambda: Limits())
+    monkeypatch.setattr(
+        ctl,
+        "gather",
+        lambda limits=None: FleetState(
+            instances=[live("uuid-a")], queue_depth=0, serving=0
+        ),
+    )
+    monkeypatch.setattr(
+        controller_mod, "decide", lambda state, limits: Decision(delete=["uuid-a"])
+    )
+
+    ctl.step()
+
+    assert deleted == ["uuid-a"]
+
+
+def test_record_lifetime_swallows_everything_including_a_missing_import(monkeypatch, caplog):
+    """``girder_sivacor`` is not installed in this venv, so the import inside
+    the helper genuinely fails here -- which is the case the try covers."""
+    controller_mod._record_lifetime(live("uuid-a"))  # must not raise
+    assert "could not record the lifetime" in caplog.text
+
+
+def test_record_lifetime_ignores_an_instance_the_tick_never_saw(monkeypatch):
+    """`by_id.get()` can miss: decision.delete is built from the same listing,
+    but a defensive None must not become an AttributeError in the reap loop."""
+    controller_mod._record_lifetime(None)  # must not raise
+
+
+class _Appender(list):
+    """Records into a shared ordering list as well as itself."""
+
+    def __init__(self, shared, label):
+        super().__init__()
+        self._shared = shared
+        self._label = label
+
+    def append(self, value):
+        self._shared.append((self._label, value))
+        super().append(value)
