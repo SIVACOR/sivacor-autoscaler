@@ -152,7 +152,7 @@ def create_volume(conn, cfg, size_gb: int) -> str:
     allocation.
 
     ``__DEFAULT__`` volume type, decided 2026-08-21 (open item 4 of
-    cinder_volumes_plan.md): ``replicated_hdd`` buys durability that is worthless for
+    05_cinder_volumes_plan.md): ``replicated_hdd`` buys durability that is worthless for
     a volume destroyed at reap, and pays for it in speed on a workload -- extraction,
     zipping -- that is IO-bound and already racing ``sivacor.max_runtime``.
 
@@ -419,7 +419,7 @@ def build_user_data(
         # volume" and skips the block entirely. Passed as the id rather than as a
         # device path because the path is a property of the guest's udev rules, not of
         # anything this process knows -- see the C0.2 measurement in
-        # cinder_volumes_plan.md V5.
+        # 05_cinder_volumes_plan.md V5.
         lines.append(f"SIVACOR_VOLUME_ID={shlex.quote(volume_id)}")
     return text.replace(INJECT_MARKER, "\n".join(lines))
 

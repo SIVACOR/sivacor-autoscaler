@@ -1,7 +1,7 @@
 """The worker-size catalogue: read it from Girder, check it against Nova.
 
 One rung per shape a submission may ask for. The catalogue lives in Girder as
-``sivacor.worker_sizes`` (P0.3 of ``worker_sizing_plan.md``) because it has to be
+``sivacor.worker_sizes`` (P0.3 of ``03_worker_sizing_plan.md``) because it has to be
 readable by two processes that share no other config channel: ``girder-sivacor``
 validates a submission against it and renders the picker from it, and this controller
 boots the flavour it names.
@@ -63,6 +63,14 @@ class Rung:
     ``flavor`` is the only provider-specific string in the whole feature, and it stops
     here: S1 keeps the ``m3.*`` name out of the wire format, the exported workflow, the
     job document and the signed TRO, so nothing downstream can start depending on it.
+
+    **The catalogue has a fifth field this deliberately does not read.**
+    ``su_per_hour`` is the allocation's cost rate for a rung, and it is Girder's
+    business alone: per-user accounting runs there, on the observations this process
+    reports at reap, so a copy here would be a field nothing reads
+    (development_notes/09_user_usage_accounting_plan.md, constraint 1 and 09-U16).
+    :func:`load` ignoring an unknown key is what makes that free -- do not "complete"
+    this dataclass against the setting.
     """
 
     memory_gb: int

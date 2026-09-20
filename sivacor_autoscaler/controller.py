@@ -17,6 +17,41 @@ from .plan import FleetState, Limits, decide
 logger = logging.getLogger(__name__)
 
 
+def _record_lifetime(instance) -> None:
+    """Report one instance's lifetime for per-user accounting, and nothing else.
+
+    **The entirety of this repo's part in that feature.** The design is
+    ``development_notes/09_user_usage_accounting_plan.md``; its first constraint
+    is that this process stays thin, because a bug here stops the fleet while a
+    bug in Girder stops a counter. So this hands over two timestamps and two tags
+    and holds no rate, no policy and no user identity: who the instance belonged
+    to, what an SU costs, whether the run was the researcher's fault to pay for
+    and what the cap is are all things Girder already knows, and it does the
+    arithmetic later on a beat of its own.
+
+    If a future change adds any of that here, it is in the wrong process.
+
+    Imported inside the function, like ``dispatch.publish``'s Girder imports and
+    for the same reason: :mod:`plan` and :mod:`signals` stay testable in a bare
+    virtualenv, and this module is imported by their tests. Swallowing the import
+    error as well as the call is not belt and braces either -- a deployment whose
+    image somehow lacks ``girder_sivacor`` must lose a counter, not stop reaping.
+    """
+    if instance is None:
+        return
+    try:
+        from girder_sivacor import usage
+
+        usage.record_lifetime(instance)
+    except Exception:
+        logger.warning(
+            "could not record the lifetime of %s; its usage will not be accrued "
+            "to anybody",
+            instance.id,
+            exc_info=True,
+        )
+
+
 @dataclass
 class Config:
     template: Path
@@ -55,7 +90,7 @@ class Config:
     #: GB of scratch volume to attach to each worker, or ``None`` for no volume.
     #:
     #: **One fixed size for every instance while this is set, not the size a
-    #: submission asked for.** C2 of cinder_volumes_plan.md is the machinery only: the
+    #: submission asked for.** C2 of 05_cinder_volumes_plan.md is the machinery only: the
     #: per-submission figure is recorded by C1 and read by C3. Keeping them apart is
     #: the same discipline as P2 shipping targeted assignment against a one-rung
     #: catalogue -- when a submission stalls there is one candidate cause, not two.
@@ -324,6 +359,11 @@ class Controller:
                 if (by_id.get(instance_id) and by_id[instance_id].volume_gb)
                 else ()
             )
+            # Strictly before the delete, for the third time and the third reason:
+            # `created_at` lives on the server, so once Nova has it there is no
+            # measuring how long this instance existed. This is the whole of this
+            # repo's part in per-user accounting -- see _record_lifetime.
+            _record_lifetime(by_id.get(instance_id))
             try:
                 fleet.delete_instance(self.conn, instance_id)
             except Exception:
