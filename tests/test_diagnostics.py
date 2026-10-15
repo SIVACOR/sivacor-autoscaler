@@ -66,7 +66,11 @@ def test_heartbeat_of_a_different_awareness_does_not_break_the_reap():
     A TypeError here would propagate out of decide() and stop the controller reaping
     anything at all -- trading a leaked instance for a better log line.
     """
-    naive = datetime(2026, 8, 11, 4, 43)  # noqa: DTZ001 -- naive is the point here
+    # Stripped from an aware value rather than written as a bare datetime(...),
+    # which needs a DTZ001 suppression that ruff 0.17 then fails CI over as
+    # unused, because this repo enables no DTZ rule. Same instant, 04:43, minus
+    # its zone -- which is the whole case.
+    naive = (NOW - timedelta(minutes=17)).replace(tzinfo=None)
     d = decide(state([inst("w1")], {"id-w1": RunningJob("job-1", naive)}), LIMITS)
     assert d.delete == ("id-w1",)
     assert "2026-08-11T04:43" in d.alerts[0]
