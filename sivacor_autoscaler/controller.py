@@ -252,6 +252,15 @@ class Controller:
             running_jobs=signals.running_jobs_by_instance(
                 self.db, self.cfg.dispatch_queue
             ),
+            # The other capture trigger, and the one that fires on a reap that looks
+            # perfectly healthy. Read every tick rather than only when
+            # `diagnostics_dir` is set, unlike `volumes` above: this also decides how
+            # a reap is *worded* and whether it is logged at WARNING, which a
+            # deployment with nowhere to write a dump still wants. It is one indexed
+            # query against at most `max_instances` ids, and it cannot fail a round.
+            house_paid=signals.house_paid_instances(
+                self.db, [i.id for i in instances]
+            ),
             # Only read when something will consult it: gather() is all-or-nothing, so
             # an unused signal must not be able to fail a round. Assignment makes it
             # mandatory, which is easy to miss because the deadline check is off in

@@ -121,6 +121,28 @@ The instance is still deleted either way. It holds a quota slot, and the submiss
 already unrecoverable — its workspace died with the VM. What changed is that the next
 one is explainable.
 
+**A dump is also kept for a reap with nothing wrong with it, when the *house* paid for
+the run** (`signals.house_paid_instances`). A worker whose submission failed and which
+then idled and powered itself off is the healthiest-looking reap there is — no RUNNING
+job, no deadline missed, `SHUTOFF, work finished` — and the console buffer it takes with
+it may be the only account of a failure that cost us the allocation. Production
+2026-10-12: a 50 h 39 m submission died because the worker's docker daemon could not
+resolve `registry-1.docker.io`, dockerd said so on the serial console, and the instance
+was deleted 10 m 48 s later with 3,254.54 SU-hours charged to the house.
+
+The predicate is the `billable: false` flag on that instance's `UsageAttribution` row —
+**the deployment's own definition of "our fault"**, derived in Girder from
+`usage.USER_PAYS`, which is asserted exhaustive over every `FailureCode`. Borrowing it
+rather than restating it means `stata_error`, `nonzero_exit` and `main_file_missing` —
+failures in the researcher's own code, where nothing is wrong with the platform — leave
+no uncurated secret-bearing file behind, and that a new failure code is classified here
+the moment it is classified there. One predicate, two uses: *if the house is paying for
+a run, keep the evidence for it.*
+
+The row survives long enough to be read because `usage.drain()` claims it only once a
+matching lifetime row exists, and this controller writes the lifetime row at reap — in
+the same loop, after the capture.
+
 In the dump, the action log is most useful for what is *missing*: a guest that ran
 `systemctl poweroff` leaves no Nova action, so `create` alone means it shut itself down,
 whereas a `stop` entry means something else did it. To watch a worker that is still

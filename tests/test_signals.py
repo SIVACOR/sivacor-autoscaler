@@ -19,6 +19,8 @@ from sivacor_autoscaler.signals import (
     READY_KEY_PREFIX,
     SUBMISSION_TYPE,
     TARGETED_ASSIGNMENT_KEY,
+    USAGE_ATTRIBUTION_COLLECTION,
+    house_paid_instances,
     ready_instance_ids,
     serving_count,
     spent_instance_ids,
@@ -426,3 +428,87 @@ def test_a_float_size_is_coerced():
     (sub,) = waiting_submissions(FakeGirder([_sized_job(5, 60.0)]))
     assert sub.memory_gb == 60
     assert isinstance(sub.memory_gb, int)
+
+
+# --- who paid for the run (the capture trigger) -----------------------------
+
+
+class FakeAttributions:
+    """``db[...]`` over Girder's usage-attribution rows, recording the query.
+
+    Applies the query itself, unlike :class:`FakeGirder` above, because the whole
+    behaviour under test is which rows the predicate selects.
+    """
+
+    def __init__(self, rows, raises=False):
+        self.rows, self.raises, self.queries = rows, raises, []
+
+    def __getitem__(self, name):
+        assert name == USAGE_ATTRIBUTION_COLLECTION, f"unexpected collection {name}"
+        return self
+
+    def find(self, query, projection=None):
+        if self.raises:
+            raise RuntimeError("mongo down")
+        self.queries.append((query, projection))
+        wanted = query["instanceId"]["$in"]
+        return [
+            row
+            for row in self.rows
+            if row.get("instanceId") in wanted
+            and row.get("billable") == query["billable"]
+        ]
+
+
+def attribution(instance_id, *, billable, code=None):
+    row = {"instanceId": instance_id, "billable": billable, "userId": "u1"}
+    if code is not None:
+        row["code"] = code
+    return row
+
+
+def test_a_run_the_house_paid_for_is_named_with_its_code():
+    db = FakeAttributions([attribution("uuid-a", billable=False, code="unexpected")])
+    assert house_paid_instances(db, ["uuid-a"]) == {"uuid-a": "unexpected"}
+
+
+def test_a_run_the_researcher_paid_for_is_not_reported():
+    """The predicate is 'we are paying', not 'it failed'. Most failures are theirs,
+    and a dump for each would be a pile of secret-bearing files about working code."""
+    db = FakeAttributions(
+        [
+            attribution("uuid-a", billable=True, code="stata_error"),
+            attribution("uuid-b", billable=True),  # a plain success
+        ]
+    )
+    assert house_paid_instances(db, ["uuid-a", "uuid-b"]) == {}
+
+
+def test_a_house_paid_row_whose_outcome_was_never_stamped_still_counts():
+    """``record_attribution`` writes the row at the terminal status and
+    ``stamp_outcome`` fills the code separately. A stamp that never arrives leaves
+    the house paying (09-U13), so the capture must not depend on it either."""
+    db = FakeAttributions([attribution("uuid-a", billable=False)])
+    assert house_paid_instances(db, ["uuid-a"]) == {"uuid-a": "unstamped"}
+
+
+def test_the_query_is_scoped_to_this_tick_s_fleet():
+    """Bounded by max_instances, so it needs no sort, no limit and no scan depth."""
+    db = FakeAttributions([attribution("uuid-a", billable=False, code="x")])
+    house_paid_instances(db, ["uuid-a", "uuid-b"])
+    (query, projection) = db.queries[0]
+    assert query == {"instanceId": {"$in": ["uuid-a", "uuid-b"]}, "billable": False}
+    assert projection == {"instanceId": 1, "code": 1}
+
+
+def test_an_empty_fleet_asks_mongo_nothing():
+    db = FakeAttributions([attribution("uuid-a", billable=False, code="x")])
+    assert house_paid_instances(db, []) == {}
+    assert db.queries == []
+
+
+def test_a_broken_attribution_read_is_not_an_error_the_caller_sees():
+    """Unlike serving_count, which raises: this feeds no arithmetic. A controller
+    that skipped the round -- and so the reap -- because a diagnostics query failed
+    would trade a leaked instance for a better post-mortem."""
+    assert house_paid_instances(FakeAttributions([], raises=True), ["uuid-a"]) == {}
