@@ -345,6 +345,12 @@ class FleetState:
     #: an empty mapping degrades every reap message to its old, less specific wording
     #: and nothing else. See :func:`signals.running_jobs_by_instance`.
     running_jobs: Mapping[str, RunningJob] = field(default_factory=dict)
+    #: Instance id -> the failure code of the run it served, for the runs the *house*
+    #: is paying for. Diagnostics only, exactly like :attr:`running_jobs`, and empty is
+    #: equally safe: it adds a reap to :attr:`Decision.abnormal` and says why, and
+    #: changes no number anywhere. See :func:`signals.house_paid_instances` for why
+    #: "the house paid" is the predicate rather than "the run failed".
+    house_paid: Mapping[str, str] = field(default_factory=dict)
     now: datetime | None = None
 
 
@@ -419,6 +425,13 @@ class Decision:
     #: Ids whose deletion destroys evidence worth keeping: capture before deleting.
     #: A worker VM is the only place its own journal and console buffer exist, and
     #: ``delete_server`` is irreversible, so this is the last moment either can be read.
+    #:
+    #: Two kinds of thing land here, and the second is not a fleet fault at all: a
+    #: *fleet* that misbehaved (a worker that died under a live run, one that never
+    #: provisioned, one past the lifetime ceiling), and a *run* the house paid for --
+    #: see :attr:`FleetState.house_paid`. Capturing only the first left the
+    #: 2026-10-12 production failure unexplainable: the reap was textbook, and the
+    #: console buffer that held the answer went with it.
     abnormal: frozenset[str] = frozenset()
     #: Instance id -> why it is being reaped, the same text as in :attr:`reasons` or
     #: :attr:`alerts` without the ``reap <name>:`` prefix. Carried by id so the caller
@@ -535,6 +548,25 @@ def decide(state: FleetState, limits: Limits) -> Decision:
             return
         seen.add(inst.id)
         delete.append(inst.id)
+        # Keep the evidence for a run WE are paying for, whatever else is or is not
+        # wrong with the fleet. Every other entry in `abnormal` describes a *fleet*
+        # that misbehaved; this one describes a *run* whose cost we absorbed, and the
+        # overwhelmingly common shape of that is the healthiest-looking reap there is
+        # -- a worker whose submission failed, which then idled and powered itself off
+        # exactly as designed. Folded into _reap rather than added as a fifth branch
+        # so an instance that is both house-paid and fleet-anomalous is still one
+        # delete, one reason and one dump.
+        if (code := state.house_paid.get(inst.id)) is not None:
+            why = (
+                # Already being captured for a fleet fault: say what the run cost us
+                # and stop, rather than repeating "capture this" a second time.
+                f"{why}. The house is paying for its run ({code})"
+                if alarming
+                else f"{why}. The house is paying for this instance's run ({code}), "
+                "so its console is evidence about us rather than about the "
+                "researcher -- capture it before this delete"
+            )
+            alarming = True
         reap_reasons[inst.id] = why
         line = f"reap {inst.name}: {why}"
         reasons.append(line)

@@ -282,6 +282,100 @@ def running_jobs_by_instance(db, queue_prefix: str = "sivacor") -> dict[str, Run
     return out
 
 
+#: Girder's per-instance attribution row, written by ``girder_sivacor.usage``. Must
+#: match ``girder_sivacor.models.usage.UsageAttribution.name``.
+#:
+#: Read here for one field only: ``billable``, which is the *deployment's own*
+#: definition of whose fault a run's failure was -- derived in Girder from
+#: ``usage.USER_PAYS``, a table asserted exhaustive over ``FailureCode`` at import.
+#: Borrowing it rather than restating it is the whole point: the predicate "the house
+#: is paying for this run" stays correct here when a failure code is added over there,
+#: and this module never has to hold an opinion about which failures are ours.
+USAGE_ATTRIBUTION_COLLECTION = "sivacor_usage_attribution"
+
+#: What a house-paid row with no failure code yet is reported as. The row is written
+#: when the job reaches a terminal status and the code is stamped separately, so an
+#: unstamped row means the stamp has not landed (or never will -- in which case
+#: 09-U13's fail-safe leaves the house paying anyway, so it still belongs here).
+UNSTAMPED_CODE = "unstamped"
+
+
+def house_paid_instances(db, instance_ids) -> dict[str, str]:
+    """Instance id -> failure code, for the runs **we** are paying for.
+
+    The trigger for keeping a worker's console buffer, and a sibling of
+    :func:`running_jobs_by_instance` in every respect including its contract.
+
+    *Why this predicate.* The capture was armed only for a fleet that misbehaved --
+    a VM that powered off under a live run, one that never provisioned, one past the
+    lifetime ceiling. A worker whose submission *failed* and which then idled and
+    powered itself off cleanly is reaped through the ordinary "work finished" branch,
+    and ``delete_server`` takes its console with it. Production 2026-10-12: a 50 h
+    39 m submission died because the worker's docker daemon could not resolve
+    ``registry-1.docker.io``; dockerd's own account of that was in the console ring
+    (``worker-cloud-init.sh`` ships ``journalctl -u docker.service`` to the serial
+    console), the instance was reaped 10 m 48 s later as an ordinary spent worker, and
+    3,254.54 SU-hours went to the house for a failure nobody can now explain.
+
+    *Why not "any ERROR".* Most failures are the researcher's own -- ``stata_error``,
+    ``nonzero_exit``, ``main_file_missing`` -- and a dump for each would be a pile of
+    uncurated, secret-bearing files describing runs where nothing is wrong with the
+    platform. ``billable: false`` is already the deployment's answer to *was this our
+    fault*; see :data:`USAGE_ATTRIBUTION_COLLECTION`. One predicate, two uses.
+
+    *Why the row is still there.* It is written when the job reaches a terminal status
+    and claimed by ``usage.drain()`` only once a matching *lifetime* row exists -- and
+    the lifetime row is written by this controller, at reap, after this read. So the
+    attribution outlives the decision that consults it, by construction rather than by
+    luck.
+
+    **Never raises, and an empty result is safe.** Like
+    :func:`running_jobs_by_instance` this feeds no arithmetic: it decides how a reap is
+    worded and whether the console is kept first. A controller that stopped reaping
+    because a *diagnostics* query failed would trade a leaked instance for a better
+    post-mortem, which is the wrong trade. Callers get ``{}`` and the pre-2026-10-14
+    behaviour.
+
+    Scoped to ``instance_ids`` -- this tick's fleet -- rather than scanning the
+    collection: the answer is only ever consulted per reaped instance, so the query is
+    bounded by ``max_instances`` and needs no sort, no limit, and no guess about how
+    deep to look.
+    """
+    ids = [str(i) for i in instance_ids]
+    if not ids:
+        # No fleet, nothing to attribute. Skipping the call rather than asking for
+        # ``$in: []`` keeps the scale-from-zero tick free of a Mongo round trip.
+        return {}
+    try:
+        rows = list(
+            db[USAGE_ATTRIBUTION_COLLECTION].find(
+                # ``billable: False`` matches the stored boolean only. Both writers
+                # set it with ``$max`` on every upsert, so the field is always
+                # present; a row missing it would be a girder_sivacor bug, and
+                # declining to capture for it is the quiet-but-safe direction, the
+                # same one 09-U13 picks.
+                {"instanceId": {"$in": ids}, "billable": False},
+                {"instanceId": 1, "code": 1},
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Could not read usage attribution; a worker reaped this round will be "
+            "deleted without a post-mortem even if the house paid for its run",
+            exc_info=True,
+        )
+        return {}
+
+    out = {
+        str(row["instanceId"]): str(row.get("code") or UNSTAMPED_CODE)
+        for row in rows
+        if row.get("instanceId")
+    }
+    if out:
+        logger.debug("house-paid instances: %s", sorted(out.items()))
+    return out
+
+
 def waiting_submissions(db) -> tuple[WaitingSubmission, ...]:
     """Every RUNNING submission that no worker has been given, with its age.
 
